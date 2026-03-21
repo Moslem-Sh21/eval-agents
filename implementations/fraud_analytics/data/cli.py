@@ -141,7 +141,7 @@ def create_db(db_path: str, sample_size: int, skip_download: bool) -> None:
             "mcc_codes.json": settings.mcc_codes_json,
         }
 
-        sandbox = None
+    sandbox = None
         try:
             sandbox = Sandbox.create(template=template_id, api_key=api_key)
             for sandbox_name, local_path in sandbox_files.items():
