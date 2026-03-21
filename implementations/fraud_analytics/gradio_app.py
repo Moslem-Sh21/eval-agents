@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 def _log_to_langfuse(case: CaseRecord, run_result: RunResult, match: bool) -> None:
     """Log investigation result to LangFuse as scores.
 
-    Uses lf.score() directly — compatible with Langfuse v3 SDK which removed
+    Uses lf.create_score() directly — compatible with Langfuse v3 SDK which removed
     the lf.trace() method. Each investigation gets a unique trace_id so scores
     can be tracked per case in the LangFuse dashboard.
     """
@@ -50,7 +50,7 @@ def _log_to_langfuse(case: CaseRecord, run_result: RunResult, match: bool) -> No
         trace_id = f"ui_{case.case_id}_{int(time.time())}"
 
         # Core accuracy score
-        lf.score(
+        lf.create_score(
             trace_id=trace_id,
             name="ui_accuracy",
             value=1.0 if match else 0.0,
@@ -63,7 +63,7 @@ def _log_to_langfuse(case: CaseRecord, run_result: RunResult, match: bool) -> No
 
         if run_result.output:
             # Confidence score
-            lf.score(
+            lf.create_score(
                 trace_id=trace_id,
                 name="confidence_score",
                 value=run_result.output.confidence_score,
@@ -71,17 +71,17 @@ def _log_to_langfuse(case: CaseRecord, run_result: RunResult, match: bool) -> No
             )
 
         # Tool-use scores
-        lf.score(
+        lf.create_score(
             trace_id=trace_id,
             name="check_accuracy_called",
             value=1.0 if run_result.check_accuracy_called else 0.0,
         )
-        lf.score(
+        lf.create_score(
             trace_id=trace_id,
             name="sql_safe",
             value=1.0 if run_result.sql_safe else 0.0,
         )
-        lf.score(
+        lf.create_score(
             trace_id=trace_id,
             name="e2b_called",
             value=1.0 if run_result.e2b_called else 0.0,
