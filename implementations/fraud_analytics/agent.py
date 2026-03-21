@@ -1,0 +1,500 @@
+"""Fraud Analytics Agent.
+
+A Google ADK agent backed by Gemini that investigates fraud cases using four tools:
+  - get_schema()       : inspect the DB schema before querying
+  - execute_sql()      : run read-only SQL against the transactions database
+  - check_accuracy()   : look up ground-truth fraud label for a transaction ID
+  - run_python()       : execute Python analysis code in an E2B sandbox
+
+The agent is instructed to follow a structured investigation workflow and
+produce a FraudAnalysisOutput JSON block as its final response.
+
+The module exposes `root_agent` for ADK web UI discovery:
+    uv run adk web --port 8000 --reload --reload_agents implementations/
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from google.adk.agents import Agent
+from google.genai import types as genai_types
+
+from implementations.fraud_analytics.env_vars import settings
+from implementations.fraud_analytics.models import AccuracyResult, CaseRecord, FraudAnalysisOutput
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tool: get_schema
+# ---------------------------------------------------------------------------
+
+def get_schema() -> str:
+    """Return the database schema as a markdown-formatted string.
+
+    The agent should call this tool FIRST before writing any SQL queries.
+    It shows all tables, columns, and types so the agent can write correct queries.
+
+    Returns:
+        A markdown table listing all tables and their columns.
+    """
+    db_path = Path(settings.db.database)
+    if not db_path.exists():
+        return "❌ Database not found. Run `cli.py create-db` first."
+
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+        ).fetchall()
+
+        lines = ["## Database Schema\n"]
+        for (table_name,) in tables:
+            lines.append(f"### `{table_name}`\n")
+            cols = conn.execute(f"PRAGMA table_info({table_name});").fetchall()
+            lines.append("| # | Column | Type | NotNull | PK |")
+            lines.append("|---|--------|------|---------|-----|")
+            for col in cols:
+                lines.append(f"| {col[0]} | `{col[1]}` | {col[2]} | {bool(col[3])} | {bool(col[5])} |")
+            # Show row count
+            count = conn.execute(f"SELECT COUNT(*) FROM {table_name};").fetchone()[0]
+            lines.append(f"\n*{count:,} rows*\n")
+
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool: execute_sql
+# ---------------------------------------------------------------------------
+
+_MAX_ROWS = 100
+_QUERY_TIMEOUT_SEC = 15
+_ALLOWED_STATEMENT_STARTS = {"select", "with", "explain"}
+_BLOCKED_KEYWORDS = {
+    "insert", "update", "delete", "drop", "create", "alter",
+    "truncate", "replace", "attach", "detach", "pragma",
+}
+
+
+def execute_sql(query: str) -> str:
+    """Execute a read-only SQL query against the fraud transactions database.
+
+    IMPORTANT RESTRICTIONS:
+    - Only SELECT / WITH / EXPLAIN statements are allowed.
+    - No INSERT, UPDATE, DELETE, DROP, CREATE, or any write operation.
+    - Results are limited to 100 rows maximum.
+    - Queries exceeding 15 seconds will be cancelled.
+
+    Args:
+        query: A valid read-only SQL query string.
+
+    Returns:
+        Query results formatted as a markdown table, or an error message.
+    """
+    # Safety: strip and lower-check statement start
+    stripped = query.strip().lstrip("(").lower()
+    first_word = stripped.split()[0] if stripped.split() else ""
+
+    if first_word not in _ALLOWED_STATEMENT_STARTS:
+        return (
+            f"❌ SQL blocked: statement starts with '{first_word}'. "
+            f"Only SELECT/WITH/EXPLAIN queries are permitted."
+        )
+
+    # Block dangerous keywords anywhere in the query
+    query_lower = query.lower()
+    for kw in _BLOCKED_KEYWORDS:
+        # Check for keyword as a whole word
+        import re
+        if re.search(rf"\b{kw}\b", query_lower):
+            return f"❌ SQL blocked: contains forbidden keyword '{kw}'."
+
+    db_path = Path(settings.db.database)
+    if not db_path.exists():
+        return "❌ Database not found. Run `cli.py create-db` first."
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.set_authorizer(_read_only_authorizer)
+
+    try:
+        conn.execute(f"PRAGMA query_only = ON;")
+        cursor = conn.execute(query)
+        rows = cursor.fetchmany(_MAX_ROWS)
+        col_names = [d[0] for d in cursor.description] if cursor.description else []
+
+        if not rows:
+            return "*(query returned 0 rows)*"
+
+        # Format as markdown table
+        lines = ["| " + " | ".join(col_names) + " |"]
+        lines.append("| " + " | ".join(["---"] * len(col_names)) + " |")
+        for row in rows:
+            lines.append("| " + " | ".join(str(v) if v is not None else "NULL" for v in row) + " |")
+
+        total_note = ""
+        if len(rows) == _MAX_ROWS:
+            # Check if there are more rows
+            total_note = f"\n\n*Results limited to {_MAX_ROWS} rows. Refine your query to see more.*"
+
+        return "\n".join(lines) + total_note
+
+    except sqlite3.OperationalError as e:
+        return f"❌ SQL error: {e}"
+    except Exception as e:
+        return f"❌ Unexpected error: {e}"
+    finally:
+        conn.close()
+
+
+def _read_only_authorizer(action_code: int, *args: Any) -> int:
+    """SQLite authorizer that blocks all write operations."""
+    import sqlite3 as _sqlite3
+    _WRITE_ACTIONS = {
+        _sqlite3.SQLITE_INSERT,
+        _sqlite3.SQLITE_UPDATE,
+        _sqlite3.SQLITE_DELETE,
+        _sqlite3.SQLITE_CREATE_TABLE,
+        _sqlite3.SQLITE_DROP_TABLE,
+        _sqlite3.SQLITE_ALTER_TABLE,
+        _sqlite3.SQLITE_ATTACH,
+    }
+    if action_code in _WRITE_ACTIONS:
+        return _sqlite3.SQLITE_DENY
+    return _sqlite3.SQLITE_OK
+
+
+# ---------------------------------------------------------------------------
+# Tool: check_accuracy
+# ---------------------------------------------------------------------------
+
+# Module-level cache of case records for fast lookup
+_case_index: dict[str, CaseRecord] | None = None
+
+
+def _load_case_index() -> dict[str, CaseRecord]:
+    """Load and cache case records keyed by seed_transaction_id."""
+    global _case_index
+    if _case_index is not None:
+        return _case_index
+
+    cases_path = Path(settings.cases_path)
+    if not cases_path.exists():
+        logger.warning("Cases file not found at %s — check_accuracy will always return not found.", cases_path)
+        _case_index = {}
+        return _case_index
+
+    index: dict[str, CaseRecord] = {}
+    with open(cases_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                case = CaseRecord.model_validate_json(line)
+                index[case.seed_transaction_id] = case
+            except Exception as e:
+                logger.warning("Could not parse case line: %s — %s", line[:80], e)
+
+    _case_index = index
+    logger.info("Loaded %d cases into check_accuracy index.", len(index))
+    return _case_index
+
+
+def check_accuracy(transaction_id: str, predicted_is_fraud: bool) -> str:
+    """Look up the ground-truth fraud label for a transaction and compare with your prediction.
+
+    Use this tool AFTER you have completed your SQL investigation and formed
+    a verdict. It reveals whether your prediction matches the dataset label,
+    which you should factor into your explanation and confidence score.
+
+    Args:
+        transaction_id: The transaction ID you investigated (the seed transaction).
+        predicted_is_fraud: Your current prediction — True if you believe it is fraud.
+
+    Returns:
+        A JSON string containing the ground truth label and whether your
+        prediction matched. Incorporate this into your final verdict.
+    """
+    index = _load_case_index()
+
+    if transaction_id not in index:
+        # Fallback: query the DB directly
+        db_path = Path(settings.db.database)
+        if db_path.exists():
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT is_fraud FROM transactions WHERE id = ? LIMIT 1",
+                    (transaction_id,),
+                ).fetchone()
+                if row is not None:
+                    ground_truth = bool(row[0])
+                    match = ground_truth == predicted_is_fraud
+                    result = AccuracyResult(
+                        transaction_id=transaction_id,
+                        ground_truth_is_fraud=ground_truth,
+                        agent_prediction=predicted_is_fraud,
+                        match=match,
+                        message=(
+                            f"✅ Prediction CORRECT — transaction {transaction_id} is "
+                            f"{'FRAUDULENT' if ground_truth else 'LEGITIMATE'} in the ground truth."
+                            if match else
+                            f"❌ Prediction INCORRECT — transaction {transaction_id} is "
+                            f"{'FRAUDULENT' if ground_truth else 'LEGITIMATE'} in the ground truth, "
+                            f"but you predicted {'fraud' if predicted_is_fraud else 'legitimate'}. "
+                            f"Review your evidence and reconsider your confidence score."
+                        ),
+                    )
+                    return result.model_dump_json(indent=2)
+            finally:
+                conn.close()
+
+        return json.dumps({
+            "error": f"Transaction ID '{transaction_id}' not found in case index or database.",
+            "hint": "Ensure the transaction_id matches the seed_transaction_id for this case.",
+        })
+
+    case = index[transaction_id]
+    ground_truth = case.ground_truth_is_fraud
+    match = ground_truth == predicted_is_fraud
+
+    result = AccuracyResult(
+        transaction_id=transaction_id,
+        ground_truth_is_fraud=ground_truth,
+        agent_prediction=predicted_is_fraud,
+        match=match,
+        message=(
+            f"✅ Prediction CORRECT — transaction {transaction_id} is "
+            f"{'FRAUDULENT' if ground_truth else 'LEGITIMATE'} in the ground truth."
+            if match else
+            f"❌ Prediction INCORRECT — transaction {transaction_id} is "
+            f"{'FRAUDULENT' if ground_truth else 'LEGITIMATE'} in the ground truth, "
+            f"but you predicted {'fraud' if predicted_is_fraud else 'legitimate'}. "
+            f"Review your evidence and reconsider your confidence score."
+        ),
+    )
+    return result.model_dump_json(indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: run_python
+# ---------------------------------------------------------------------------
+
+def run_python(code: str) -> str:
+    """Execute Python code in a secure E2B cloud sandbox for deeper analysis.
+
+    Use this tool when SQL alone is insufficient — for example:
+    - Statistical analysis of a cardholder's transaction history
+    - Computing velocity metrics (transactions per hour/day)
+    - Visualising spending patterns as text/ASCII
+    - Calculating deviation scores or z-scores
+
+    IMPORTANT: The full Kaggle transactions-fraud dataset is pre-loaded inside
+    the sandbox at these paths:
+        /data/transactions_data.csv  — all transactions (including is_fraud label)
+        /data/cards_data.csv         — card metadata
+        /data/users_data.csv         — user/customer metadata
+        /data/mcc_codes.json         — merchant category codes
+
+    The sandbox has pandas, numpy, scipy, and matplotlib available.
+    Use print() to return results. Do not write files — use print() for output.
+
+    Example:
+        import pandas as pd
+        df = pd.read_csv('/data/transactions_data.csv')
+        print(df[df['client_id'] == '12345']['amount'].describe())
+
+    Args:
+        code: Valid Python code to execute. Use print() to return results.
+
+    Returns:
+        stdout output from the executed code, or an error message.
+    """
+    try:
+        from e2b_code_interpreter import Sandbox
+    except ImportError:
+        return (
+            "❌ e2b_code_interpreter is not installed. "
+            "Add it to pyproject.toml: e2b-code-interpreter>=2.4.1"
+        )
+
+    # Use the pre-configured template that has the fraud dataset at /data/.
+    # api_key=None falls back to the E2B_API_KEY env var automatically.
+    api_key = settings.e2b_api_key or None
+    template_id = settings.e2b_template_id  # "q1sg157kmhnqbfjth0ue"
+
+    try:
+        with Sandbox(template=template_id, api_key=api_key) as sandbox:
+            execution = sandbox.run_code(code)
+
+            output_parts = []
+
+            if execution.logs.stdout:
+                output_parts.append("**stdout:**\n" + "\n".join(execution.logs.stdout))
+
+            if execution.logs.stderr:
+                output_parts.append("**stderr:**\n" + "\n".join(execution.logs.stderr))
+
+            if execution.error:
+                output_parts.append(f"**error:** {execution.error.name}: {execution.error.value}")
+                if execution.error.traceback:
+                    output_parts.append("**traceback:**\n" + execution.error.traceback)
+
+            if not output_parts:
+                return "*(code executed with no output)*"
+
+            return "\n\n".join(output_parts)
+
+    except Exception as e:
+        return f"❌ E2B sandbox error: {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Agent definition
+# ---------------------------------------------------------------------------
+
+_SYSTEM_INSTRUCTION = """You are an expert fraud investigator. Your job is to investigate financial transactions
+and determine whether they are fraudulent.
+
+## Investigation Workflow
+
+For each case you receive, follow these steps in order:
+
+1. **Understand the schema** — Call `get_schema()` first to understand what tables and columns are available.
+
+2. **Examine the seed transaction** — Query the `transactions` table for the seed_transaction_id provided.
+   Note the amount, merchant, use_chip type, date, client_id, and card_id.
+
+3. **Check the account history** — Query the last 30 days of transactions for the same client_id and card_id
+   within the investigation window (window_start to window_end). Look for:
+   - Unusual amounts relative to the account's history
+   - Repeated merchant IDs or suspicious merchant names
+   - Multiple declined transactions (errors column)
+   - Transactions in different geographic locations in short time spans
+   - Online transactions ("Online Transaction" in use_chip) followed by in-person ones
+
+4. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
+   deviation scores, or statistical anomalies that SQL alone cannot easily express.
+
+5. **Check your accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)` with your
+   current verdict. Factor the result into your confidence score.
+
+6. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
+   ```json
+   {
+     "is_fraud": true,
+     "fraud_pattern": "unusual_velocity",
+     "flagged_transaction_ids": ["TXN_001", "TXN_002"],
+     "confidence_score": 0.85,
+     "explanation": "..."
+   }
+   ```
+
+## Fraud Patterns
+Valid values for `fraud_pattern`:
+- `card_not_present` — Online transaction with no chip
+- `account_takeover` — Bad PIN, unusual login location
+- `identity_theft` — New merchant category, unusual demographics
+- `smurfing` — Multiple small transactions just under reporting thresholds
+- `merchant_fraud` — Suspicious merchant (unknown ID, unusual MCC)
+- `unusual_velocity` — Too many transactions in short time
+- `geo_anomaly` — Transactions in geographically impossible locations
+- `unknown` — Fraud detected but pattern unclear
+- `none` — Transaction is legitimate
+
+## Important Rules
+- Stay within the investigation window (window_start to window_end).
+- Only use SELECT queries — no writes, no schema changes.
+- Always call `check_accuracy()` before producing your final output.
+- Your explanation MUST reference specific SQL results (amounts, dates, merchant IDs, etc.).
+- Set confidence_score = 0.0-0.4 for weak evidence, 0.5-0.7 for moderate, 0.8-1.0 for strong.
+"""
+
+
+root_agent = Agent(
+    name="fraud_analytics_agent",
+    model=settings.agent_model,
+    description=(
+        "A fraud investigation agent that queries a financial transactions database "
+        "using read-only SQL, verifies ground-truth labels via check_accuracy, and "
+        "optionally runs Python analysis in an E2B sandbox."
+    ),
+    instruction=_SYSTEM_INSTRUCTION,
+    tools=[get_schema, execute_sql, check_accuracy, run_python],
+)
+
+
+# ---------------------------------------------------------------------------
+# Runner helper used by cli.py and gradio_app.py
+# ---------------------------------------------------------------------------
+
+async def run_case(case: CaseRecord) -> FraudAnalysisOutput | None:
+    """Run the agent on a single CaseRecord and return structured output.
+
+    Returns None if the agent response cannot be parsed into FraudAnalysisOutput.
+    """
+    import asyncio
+    import re
+
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types as genai_types
+
+    session_service = InMemorySessionService()
+    session = await session_service.create_session(
+        app_name="fraud_analytics",
+        user_id="batch_runner",
+        session_id=case.case_id,
+    )
+
+    runner = Runner(
+        agent=root_agent,
+        app_name="fraud_analytics",
+        session_service=session_service,
+    )
+
+    prompt = (
+        f"Investigate the following fraud case:\n\n"
+        f"**Case ID:** {case.case_id}\n"
+        f"**Seed Transaction ID:** {case.seed_transaction_id}\n"
+        f"**Client ID:** {case.client_id}\n"
+        f"**Card ID:** {case.card_id}\n"
+        f"**Investigation Window:** {case.window_start} to {case.window_end}\n"
+        f"**Trigger:** {case.trigger_label}\n\n"
+        f"Follow the investigation workflow. End with a JSON block containing your verdict."
+    )
+
+    user_message = genai_types.Content(
+        role="user",
+        parts=[genai_types.Part(text=prompt)],
+    )
+
+    final_text = ""
+    async for event in runner.run_async(
+        user_id="batch_runner",
+        session_id=case.case_id,
+        new_message=user_message,
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            final_text = "".join(p.text for p in event.content.parts if hasattr(p, "text"))
+
+    # Extract JSON block from response
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", final_text, re.DOTALL)
+    if not json_match:
+        # Try bare JSON object
+        json_match = re.search(r"(\{[^{}]*\"is_fraud\"[^{}]*\})", final_text, re.DOTALL)
+
+    if json_match:
+        try:
+            return FraudAnalysisOutput.model_validate_json(json_match.group(1))
+        except Exception as e:
+            logger.warning("Failed to parse agent output for %s: %s", case.case_id, e)
+
+    logger.warning("No valid JSON output found for case %s", case.case_id)
+    return None
