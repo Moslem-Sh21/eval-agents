@@ -329,30 +329,27 @@ def run_python(code: str) -> str:
     api_key = settings.e2b_api_key or None
     template_id = settings.e2b_template_id  # "q1sg157kmhnqbfjth0ue"
 
+    sandbox = None
     try:
-        with Sandbox(template=template_id, api_key=api_key) as sandbox:
-            execution = sandbox.run_code(code)
-
-            output_parts = []
-
-            if execution.logs.stdout:
-                output_parts.append("**stdout:**\n" + "\n".join(execution.logs.stdout))
-
-            if execution.logs.stderr:
-                output_parts.append("**stderr:**\n" + "\n".join(execution.logs.stderr))
-
-            if execution.error:
-                output_parts.append(f"**error:** {execution.error.name}: {execution.error.value}")
-                if execution.error.traceback:
-                    output_parts.append("**traceback:**\n" + execution.error.traceback)
-
-            if not output_parts:
-                return "*(code executed with no output)*"
-
-            return "\n\n".join(output_parts)
-
+        sandbox = Sandbox.create(template=template_id, api_key=api_key)
+        execution = sandbox.run_code(code)
+        output_parts = []
+        if execution.logs.stdout:
+            output_parts.append("**stdout:**\n" + "\n".join(execution.logs.stdout))
+        if execution.logs.stderr:
+            output_parts.append("**stderr:**\n" + "\n".join(execution.logs.stderr))
+        if execution.error:
+            output_parts.append(f"**error:** {execution.error.name}: {execution.error.value}")
+            if execution.error.traceback:
+                output_parts.append("**traceback:**\n" + execution.error.traceback)
+        if not output_parts:
+            return "*(code executed with no output)*"
+        return "\n\n".join(output_parts)
     except Exception as e:
         return f"❌ E2B sandbox error: {type(e).__name__}: {e}"
+    finally:
+        if sandbox is not None:
+            sandbox.kill()
 
 
 # ---------------------------------------------------------------------------
