@@ -139,6 +139,7 @@ def create_db(db_path: str, sample_size: int, skip_download: bool) -> None:
             "cards_data.csv": settings.cards_csv,
             "users_data.csv": settings.users_csv,
             "mcc_codes.json": settings.mcc_codes_json,
+            "train_fraud_labels.json": settings.data_dir / "train_fraud_labels.json",
         }
 
         sandbox = None
@@ -191,16 +192,8 @@ def create_db(db_path: str, sample_size: int, skip_download: bool) -> None:
     click.echo(f"  Loading transactions (sample_size={sample_size or 'all'})...")
     tx_df = pd.read_csv(transactions_csv, low_memory=False)
     if sample_size and len(tx_df) > sample_size:
-        # Stratified sample: preserve fraud ratio
-        fraud_df = tx_df[tx_df["is_fraud"] == 1]
-        legit_df = tx_df[tx_df["is_fraud"] == 0]
-        fraud_n = min(len(fraud_df), max(1, int(sample_size * (len(fraud_df) / len(tx_df)))))
-        legit_n = sample_size - fraud_n
-        tx_df = pd.concat([
-            fraud_df.sample(n=fraud_n, random_state=42),
-            legit_df.sample(n=legit_n, random_state=42),
-        ]).sample(frac=1, random_state=42).reset_index(drop=True)
-        click.echo(f"  Sampled {len(tx_df):,} rows ({fraud_n:,} fraud, {legit_n:,} legit).")
+        tx_df = tx_df.sample(n=sample_size, random_state=42).reset_index(drop=True)
+        click.echo(f"  Sampled {len(tx_df):,} rows.")
 
     cards_df = pd.read_csv(cards_csv, low_memory=False)
     users_df = pd.read_csv(users_csv, low_memory=False)
@@ -220,12 +213,30 @@ def create_db(db_path: str, sample_size: int, skip_download: bool) -> None:
     users_df = _norm(users_df)
 
     # Ensure is_fraud is int 0/1 (some versions use 'Yes'/'No')
-    if tx_df["is_fraud"].dtype == object:
-        tx_df["is_fraud"] = tx_df["is_fraud"].str.strip().str.lower().map(
-            {"yes": 1, "no": 0, "1": 1, "0": 0, "true": 1, "false": 0}
+    labels_json = data_dir / "train_fraud_labels.json"
+    if labels_json.exists():
+        click.echo("  Joining fraud labels from train_fraud_labels.json...")
+        import json as _json
+        labels_raw = _json.loads(labels_json.read_text())
+        labels = labels_raw.get("target", labels_raw)
+        # keys are transaction IDs (as strings), values are "Yes"/"No"
+        labels_series = pd.Series(labels, name="is_fraud")
+        labels_series.index = labels_series.index.astype(str)
+        labels_series = labels_series.str.strip().str.lower().map(
+            {"yes": 1, "no": 0}
         ).fillna(0).astype(int)
-    else:
+        tx_df["id"] = tx_df["id"].astype(str)
+        tx_df = tx_df.merge(
+            labels_series.rename("is_fraud"),
+            left_on="id",
+            right_index=True,
+            how="left",
+        )
         tx_df["is_fraud"] = tx_df["is_fraud"].fillna(0).astype(int)
+        click.echo(f"  Labels joined: {tx_df['is_fraud'].sum():,} fraudulent transactions.")
+    else:
+        click.echo("  ⚠  train_fraud_labels.json not found — is_fraud will be 0 for all rows.")
+        tx_df["is_fraud"] = 0
 
     # Rename id columns to canonical names
     if "unnamed_0" in tx_df.columns:
