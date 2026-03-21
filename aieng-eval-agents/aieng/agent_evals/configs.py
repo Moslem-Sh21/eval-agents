@@ -86,6 +86,10 @@ class Configs(BaseSettings):
         default=None,
         description="Database configuration for the the Report Generation Agent.",
     )
+    fraud_db: DatabaseConfig | None = Field(
+        default=None,
+        description="Database configuration for the Fraud Analytics Agent.",
+    )
 
     # === Core LLM Settings ===
     openai_base_url: str = Field(
