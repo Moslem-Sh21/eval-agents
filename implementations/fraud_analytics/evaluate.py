@@ -431,20 +431,20 @@ async def evaluate_async(
         # Arrow 4: upload item scores to LangFuse
         try:
             lf_trace_id = f"{run_name}_{case.case_id}"
-            langfuse.score(
+            langfuse.create_score(
                 trace_id=lf_trace_id,
                 name="deterministic_composite",
                 value=det["composite_score"],
                 comment=f"is_fraud_correct={det['is_fraud_correct']}",
             )
-            langfuse.score(
+            langfuse.create_score(
                 trace_id=lf_trace_id,
                 name="tool_use_composite",
                 value=tool["composite_score"],
                 comment=f"check_accuracy={tool['check_accuracy_called']}, sql_safe={tool['sql_safe']}",
             )
             if llm.get("overall_score") is not None:
-                langfuse.score(
+                langfuse.create_score(
                     trace_id=lf_trace_id,
                     name="explanation_quality",
                     value=llm["overall_score"],
@@ -516,11 +516,11 @@ async def evaluate_async(
     try:
         agg_id = f"{run_name}_aggregate"
         if "is_fraud" in run_metrics:
-            langfuse.score(trace_id=agg_id, name="is_fraud_f1", value=run_metrics["is_fraud"]["f1"])
-            langfuse.score(trace_id=agg_id, name="is_fraud_precision", value=run_metrics["is_fraud"]["precision"])
-            langfuse.score(trace_id=agg_id, name="is_fraud_recall", value=run_metrics["is_fraud"]["recall"])
-            langfuse.score(trace_id=agg_id, name="is_fraud_accuracy", value=run_metrics["is_fraud"]["accuracy"])
-            langfuse.score(trace_id=agg_id, name="pattern_macro_f1", value=run_metrics["fraud_pattern"]["macro_f1"])
+            langfuse.create_score(trace_id=agg_id, name="is_fraud_f1", value=run_metrics["is_fraud"]["f1"])
+            langfuse.create_score(trace_id=agg_id, name="is_fraud_precision", value=run_metrics["is_fraud"]["precision"])
+            langfuse.create_score(trace_id=agg_id, name="is_fraud_recall", value=run_metrics["is_fraud"]["recall"])
+            langfuse.create_score(trace_id=agg_id, name="is_fraud_accuracy", value=run_metrics["is_fraud"]["accuracy"])
+            langfuse.create_score(trace_id=agg_id, name="pattern_macro_f1", value=run_metrics["fraud_pattern"]["macro_f1"])
         click.echo("\n✅ Aggregate metrics uploaded to LangFuse.")
     except Exception as e:
         logger.warning("LangFuse aggregate upload failed: %s", e)
