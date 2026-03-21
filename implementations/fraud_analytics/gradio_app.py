@@ -134,7 +134,7 @@ def _get_case_choices() -> list[str]:
     return sorted(cases.keys())
 
 
-with gr.Blocks(title="Fraud Analytics Agent", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Fraud Analytics Agent") as demo:
     gr.Markdown(
         """
 # 🔍 Fraud Analytics Investigation Agent
@@ -208,4 +208,4 @@ The agent uses SQL, Python analysis (E2B), and ground-truth label lookup to prod
 
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch(share=True, theme=gr.themes.Soft())
