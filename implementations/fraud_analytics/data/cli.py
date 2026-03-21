@@ -141,24 +141,24 @@ def create_db(db_path: str, sample_size: int, skip_download: bool) -> None:
             "mcc_codes.json": settings.mcc_codes_json,
         }
 
+sandbox = None
         try:
-            with Sandbox(template=template_id, api_key=api_key) as sandbox:
-                for sandbox_name, local_path in sandbox_files.items():
-                    sandbox_path = f"/data/{sandbox_name}"
-                    click.echo(f"  ⬇  Downloading {sandbox_path} → {local_path} ...")
-                    try:
-                        content = sandbox.files.read(sandbox_path, format="bytes")
-                        local_path.parent.mkdir(parents=True, exist_ok=True)
-                        local_path.write_bytes(content)
-                        size_mb = len(content) / 1_048_576
-                        click.echo(f"     ✅ {size_mb:.1f} MB")
-                    except Exception as e:
-                        if sandbox_name == "mcc_codes.json":
-                            click.echo(f"     ⚠  {sandbox_name} not found in sandbox (optional): {e}")
-                        else:
-                            click.echo(f"     ❌ Failed to download {sandbox_name}: {e}", err=True)
-                            sys.exit(1)
-
+            sandbox = Sandbox.create(template=template_id, api_key=api_key)
+            for sandbox_name, local_path in sandbox_files.items():
+                sandbox_path = f"/data/{sandbox_name}"
+                click.echo(f"  ⬇  Downloading {sandbox_path} → {local_path} ...")
+                try:
+                    content = sandbox.files.read(sandbox_path, format="bytes")
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_bytes(content)
+                    size_mb = len(content) / 1_048_576
+                    click.echo(f"     ✅ {size_mb:.1f} MB")
+                except Exception as e:
+                    if sandbox_name == "mcc_codes.json":
+                        click.echo(f"     ⚠  {sandbox_name} not found in sandbox (optional): {e}")
+                    else:
+                        click.echo(f"     ❌ Failed to download {sandbox_name}: {e}", err=True)
+                        sys.exit(1)
         except Exception as e:
             click.echo(f"❌ E2B sandbox error: {e}", err=True)
             click.echo(
@@ -167,7 +167,9 @@ def create_db(db_path: str, sample_size: int, skip_download: bool) -> None:
                 err=True,
             )
             sys.exit(1)
-
+        finally:
+            if sandbox is not None:
+                sandbox.kill()
         click.echo("✅ All files pulled from E2B sandbox.")
     else:
         click.echo("⏭  Skipping E2B download (--skip-download set).")
