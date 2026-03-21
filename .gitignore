@@ -33,3 +33,9 @@ implementations/report_generation/data/*.zip
 implementations/report_generation/data/*.csv
 implementations/report_generation/data/*.xls
 implementations/report_generation/data/*.xlsx
+
+# Fraud Analytics generated data (large files)
+implementations/fraud_analytics/data/*.db
+implementations/fraud_analytics/data/*.csv
+implementations/fraud_analytics/data/*.json
+implementations/fraud_analytics/data/*.jsonl
