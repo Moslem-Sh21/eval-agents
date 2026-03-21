@@ -9,6 +9,11 @@ A Google ADK agent backed by Gemini that investigates fraud cases using four too
 The agent is instructed to follow a structured investigation workflow and
 produce a FraudAnalysisOutput JSON block as its final response.
 
+run_case() returns a RunResult that carries both the structured output AND
+the raw agent text + tool-call metadata. This allows evaluate.py to evaluate
+the agent's tool-use behaviour directly (Arrow 3 in the architecture diagram)
+without needing to poll LangFuse for trace data.
+
 The module exposes `root_agent` for ADK web UI discovery:
     uv run adk web --port 8000 --reload --reload_agents implementations/
 """
@@ -17,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -25,7 +31,12 @@ from google.adk.agents import Agent
 from google.genai import types as genai_types
 
 from implementations.fraud_analytics.env_vars import settings
-from implementations.fraud_analytics.models import AccuracyResult, CaseRecord, FraudAnalysisOutput
+from implementations.fraud_analytics.models import (
+    AccuracyResult,
+    CaseRecord,
+    FraudAnalysisOutput,
+    RunResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +71,6 @@ def get_schema() -> str:
             lines.append("|---|--------|------|---------|-----|")
             for col in cols:
                 lines.append(f"| {col[0]} | `{col[1]}` | {col[2]} | {bool(col[3])} | {bool(col[5])} |")
-            # Show row count
             count = conn.execute(f"SELECT COUNT(*) FROM {table_name};").fetchone()[0]
             lines.append(f"\n*{count:,} rows*\n")
 
@@ -74,7 +84,6 @@ def get_schema() -> str:
 # ---------------------------------------------------------------------------
 
 _MAX_ROWS = 100
-_QUERY_TIMEOUT_SEC = 15
 _ALLOWED_STATEMENT_STARTS = {"select", "with", "explain"}
 _BLOCKED_KEYWORDS = {
     "insert", "update", "delete", "drop", "create", "alter",
@@ -89,7 +98,6 @@ def execute_sql(query: str) -> str:
     - Only SELECT / WITH / EXPLAIN statements are allowed.
     - No INSERT, UPDATE, DELETE, DROP, CREATE, or any write operation.
     - Results are limited to 100 rows maximum.
-    - Queries exceeding 15 seconds will be cancelled.
 
     Args:
         query: A valid read-only SQL query string.
@@ -97,7 +105,6 @@ def execute_sql(query: str) -> str:
     Returns:
         Query results formatted as a markdown table, or an error message.
     """
-    # Safety: strip and lower-check statement start
     stripped = query.strip().lstrip("(").lower()
     first_word = stripped.split()[0] if stripped.split() else ""
 
@@ -107,11 +114,8 @@ def execute_sql(query: str) -> str:
             f"Only SELECT/WITH/EXPLAIN queries are permitted."
         )
 
-    # Block dangerous keywords anywhere in the query
     query_lower = query.lower()
     for kw in _BLOCKED_KEYWORDS:
-        # Check for keyword as a whole word
-        import re
         if re.search(rf"\b{kw}\b", query_lower):
             return f"❌ SQL blocked: contains forbidden keyword '{kw}'."
 
@@ -123,7 +127,7 @@ def execute_sql(query: str) -> str:
     conn.set_authorizer(_read_only_authorizer)
 
     try:
-        conn.execute(f"PRAGMA query_only = ON;")
+        conn.execute("PRAGMA query_only = ON;")
         cursor = conn.execute(query)
         rows = cursor.fetchmany(_MAX_ROWS)
         col_names = [d[0] for d in cursor.description] if cursor.description else []
@@ -131,18 +135,16 @@ def execute_sql(query: str) -> str:
         if not rows:
             return "*(query returned 0 rows)*"
 
-        # Format as markdown table
         lines = ["| " + " | ".join(col_names) + " |"]
         lines.append("| " + " | ".join(["---"] * len(col_names)) + " |")
         for row in rows:
             lines.append("| " + " | ".join(str(v) if v is not None else "NULL" for v in row) + " |")
 
-        total_note = ""
+        suffix = ""
         if len(rows) == _MAX_ROWS:
-            # Check if there are more rows
-            total_note = f"\n\n*Results limited to {_MAX_ROWS} rows. Refine your query to see more.*"
+            suffix = f"\n\n*Results limited to {_MAX_ROWS} rows. Refine your query to see more.*"
 
-        return "\n".join(lines) + total_note
+        return "\n".join(lines) + suffix
 
     except sqlite3.OperationalError as e:
         return f"❌ SQL error: {e}"
@@ -173,7 +175,6 @@ def _read_only_authorizer(action_code: int, *args: Any) -> int:
 # Tool: check_accuracy
 # ---------------------------------------------------------------------------
 
-# Module-level cache of case records for fast lookup
 _case_index: dict[str, CaseRecord] | None = None
 
 
@@ -224,7 +225,6 @@ def check_accuracy(transaction_id: str, predicted_is_fraud: bool) -> str:
     index = _load_case_index()
 
     if transaction_id not in index:
-        # Fallback: query the DB directly
         db_path = Path(settings.db.database)
         if db_path.exists():
             conn = sqlite3.connect(db_path)
@@ -324,10 +324,8 @@ def run_python(code: str) -> str:
             "Add it to pyproject.toml: e2b-code-interpreter>=2.4.1"
         )
 
-    # Use the pre-configured template that has the fraud dataset at /data/.
-    # api_key=None falls back to the E2B_API_KEY env var automatically.
     api_key = settings.e2b_api_key or None
-    template_id = settings.e2b_template_id  # "q1sg157kmhnqbfjth0ue"
+    template_id = settings.e2b_template_id
 
     sandbox = None
     try:
@@ -428,23 +426,23 @@ root_agent = Agent(
 
 
 # ---------------------------------------------------------------------------
-# Runner helper used by cli.py and gradio_app.py
+# Runner — returns RunResult for direct evaluation (Arrow 3)
 # ---------------------------------------------------------------------------
 
-async def run_case(case: CaseRecord) -> FraudAnalysisOutput | None:
-    """Run the agent on a single CaseRecord and return structured output.
+async def run_case(case: CaseRecord) -> RunResult:
+    """Run the agent on a single CaseRecord and return a RunResult.
 
-    Returns None if the agent response cannot be parsed into FraudAnalysisOutput.
+    RunResult carries both the parsed FraudAnalysisOutput AND the raw agent
+    text plus tool-call metadata. This lets evaluate.py assess tool-use
+    behaviour directly without polling LangFuse (implements Arrow 3).
+
+    Returns a RunResult with output=None if the agent response cannot be parsed.
     """
-    import asyncio
-    import re
-
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
-    from google.genai import types as genai_types
 
     session_service = InMemorySessionService()
-    session = await session_service.create_session(
+    await session_service.create_session(
         app_name="fraud_analytics",
         user_id="batch_runner",
         session_id=case.case_id,
@@ -473,25 +471,54 @@ async def run_case(case: CaseRecord) -> FraudAnalysisOutput | None:
     )
 
     final_text = ""
+    tools_called: list[str] = []
+    sql_queries: list[str] = []
+    e2b_called = False
+
     async for event in runner.run_async(
         user_id="batch_runner",
         session_id=case.case_id,
         new_message=user_message,
     ):
+        # Capture final response text
         if event.is_final_response() and event.content and event.content.parts:
             final_text = "".join(p.text for p in event.content.parts if hasattr(p, "text"))
 
-    # Extract JSON block from response
+        # Capture tool calls from intermediate events
+        if hasattr(event, "content") and event.content and event.content.parts:
+            for part in event.content.parts:
+                # ADK emits function_call parts for tool invocations
+                if hasattr(part, "function_call") and part.function_call:
+                    tool_name = part.function_call.name
+                    tools_called.append(tool_name)
+                    if tool_name == "execute_sql":
+                        args = part.function_call.args or {}
+                        query = args.get("query", "")
+                        if query:
+                            sql_queries.append(query)
+                    if tool_name == "run_python":
+                        e2b_called = True
+
+    # Parse structured output from final text
+    output: FraudAnalysisOutput | None = None
     json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", final_text, re.DOTALL)
     if not json_match:
-        # Try bare JSON object
         json_match = re.search(r"(\{[^{}]*\"is_fraud\"[^{}]*\})", final_text, re.DOTALL)
 
     if json_match:
         try:
-            return FraudAnalysisOutput.model_validate_json(json_match.group(1))
+            output = FraudAnalysisOutput.model_validate_json(json_match.group(1))
         except Exception as e:
             logger.warning("Failed to parse agent output for %s: %s", case.case_id, e)
 
-    logger.warning("No valid JSON output found for case %s", case.case_id)
-    return None
+    if output is None:
+        logger.warning("No valid JSON output found for case %s", case.case_id)
+
+    return RunResult(
+        case_id=case.case_id,
+        output=output,
+        final_text=final_text,
+        tools_called=tools_called,
+        sql_queries=sql_queries,
+        e2b_called=e2b_called,
+    )

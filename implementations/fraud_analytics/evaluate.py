@@ -1,12 +1,19 @@
 """Fraud Analytics Evaluation Pipeline.
 
 Runs a comprehensive three-level evaluation of the Fraud Analytics agent,
-mirroring the structure used by the aml_investigation module:
+following the architecture diagram exactly:
 
+  Arrow 3: Agent output flows DIRECTLY into the Offline Evaluation Script.
+           No LangFuse polling. evaluate.py calls run_case() and gets back
+           a RunResult containing both the structured output and tool-call
+           metadata for immediate evaluation.
+
+  Arrow 4: Evaluation scores are uploaded to LangFuse (Trace + Metric Store).
+
+Evaluation levels:
   Item-level    — per-case deterministic grader + LLM-as-judge (explanation quality)
-  Trace-level   — SQL safety, E2B execution success, check_accuracy call verification
-  Run-level     — precision / recall / F1 for is_fraud; macro-F1 for fraud_pattern;
-                  confusion matrix — all uploaded to LangFuse
+  Tool-use      — SQL safety, check_accuracy called, E2B success (from RunResult directly)
+  Run-level     — precision / recall / F1 for is_fraud; macro-F1 for fraud_pattern
 
 Usage
 -----
@@ -20,8 +27,6 @@ Options
     --llm-judge-timeout       Seconds per LLM judge call (default: 120)
     --llm-judge-retries       Retry attempts for LLM judge (default: 3)
     --max-concurrent-cases    Concurrent cases in batch (default: 5)
-    --max-concurrent-traces   Concurrent trace evaluations (default: 10)
-    --max-trace-wait-time     Max seconds to wait for LangFuse trace data (default: 300)
     --run-name                Experiment name in LangFuse (default: auto-generated)
     --limit                   Limit number of cases to evaluate (default: all)
 """
@@ -33,7 +38,6 @@ import json
 import logging
 import os
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -54,13 +58,15 @@ from implementations.fraud_analytics.models import (
     CaseRecord,
     FraudAnalysisOutput,
     FraudPattern,
+    RunResult,
 )
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+
 # ---------------------------------------------------------------------------
-# LangFuse client
+# LangFuse client (Arrow 4: Eval → LangFuse)
 # ---------------------------------------------------------------------------
 
 def _get_langfuse() -> Langfuse:
@@ -78,24 +84,18 @@ def _get_langfuse() -> Langfuse:
 def deterministic_item_score(case: CaseRecord, output: FraudAnalysisOutput) -> dict:
     """Score a single case deterministically against ground truth.
 
-    Returns a dict with boolean/float scores and a human-readable summary.
+    Returns a dict with boolean/float scores and a composite score.
     """
     is_fraud_correct = output.is_fraud == case.ground_truth_is_fraud
     pattern_correct = (
         output.fraud_pattern == case.ground_truth_pattern
-        or case.ground_truth_pattern == FraudPattern.UNKNOWN  # soft match
+        or case.ground_truth_pattern == FraudPattern.UNKNOWN
     )
-
-    # Flagged IDs: does the seed transaction appear when fraud is present?
     seed_flagged = (
         case.seed_transaction_id in output.flagged_transaction_ids
-        if case.ground_truth_is_fraud else True  # not penalised for legit cases
+        if case.ground_truth_is_fraud else True
     )
-
-    # Explanation non-empty
     has_explanation = bool(output.explanation and len(output.explanation.strip()) > 50)
-
-    # Confidence calibration: high confidence for correct verdicts, low for wrong
     calibration_ok = (
         (is_fraud_correct and output.confidence_score >= 0.5) or
         (not is_fraud_correct and output.confidence_score < 0.7)
@@ -122,14 +122,12 @@ def deterministic_item_score(case: CaseRecord, output: FraudAnalysisOutput) -> d
 async def llm_judge_item_score(
     case: CaseRecord,
     output: FraudAnalysisOutput,
-    langfuse: Langfuse,
     model: str,
-    timeout: int,
     retries: int,
 ) -> dict:
     """Score explanation quality using LLM-as-a-judge with the rubric.
 
-    Returns a dict with per-dimension scores, overall_score, and critique.
+    Returns per-dimension scores (1-5) and an overall_score.
     """
     rubric_path = Path(__file__).parent / "rubrics" / "explanation_quality.md"
     rubric = rubric_path.read_text() if rubric_path.exists() else "(rubric not found)"
@@ -161,14 +159,14 @@ async def llm_judge_item_score(
                 ),
             )
             text = response.text.strip()
-            # Extract JSON
             json_match = re.search(r"\{.*\}", text, re.DOTALL)
             if json_match:
-                scores = json.loads(json_match.group(0))
-                # Log to LangFuse as a score on this trace
-                return scores
+                return json.loads(json_match.group(0))
         except Exception as e:
-            logger.warning("LLM judge attempt %d/%d failed for case %s: %s", attempt + 1, retries, case.case_id, e)
+            logger.warning(
+                "LLM judge attempt %d/%d failed for case %s: %s",
+                attempt + 1, retries, case.case_id, e,
+            )
             if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
 
@@ -183,94 +181,69 @@ async def llm_judge_item_score(
 
 
 # ---------------------------------------------------------------------------
-# Trace-level evaluators
+# Tool-use evaluator (replaces LangFuse trace polling — Arrow 3)
 # ---------------------------------------------------------------------------
 
-async def trace_deterministic_score(
-    case: CaseRecord,
-    langfuse: Langfuse,
-    max_wait: int,
-) -> dict:
-    """Fetch trace from LangFuse and check tool-use safety properties.
+def tool_use_score(case: CaseRecord, run_result: RunResult) -> dict:
+    """Evaluate tool-use quality DIRECTLY from RunResult (Arrow 3).
+
+    This is the key fix: instead of waiting for LangFuse traces and polling
+    the API, we evaluate the agent's tool-use behaviour directly from the
+    RunResult returned by run_case(). RunResult carries:
+      - tools_called: list of tool names from ADK events
+      - sql_queries: list of SQL strings executed
+      - e2b_called: bool
+      - final_text: full agent response for fallback scanning
 
     Checks:
-      - sql_safety: all SQL tool calls used SELECT only
-      - check_accuracy_called: agent called check_accuracy at least once
-      - e2b_exec_success: if run_python was called, it succeeded (no error in output)
-      - no_redundant_queries: no identical SQL queries in a row
+      - check_accuracy_called: agent used the accuracy check tool
+      - sql_safe: no write keywords in any SQL query
+      - e2b_called: agent used Python analysis when useful
+      - calibration_ok: confidence is consistent with correctness
     """
-    # Give LangFuse time to ingest the trace
-    deadline = time.time() + max_wait
-    trace = None
-
-    while time.time() < deadline:
-        try:
-            traces = langfuse.fetch_traces(
-                tags=[case.case_id],
-                limit=1,
-            )
-            if traces.data:
-                trace = traces.data[0]
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(5)
-
-    if trace is None:
+    output = run_result.output
+    if output is None:
         return {
-            "sql_safety": None,
-            "check_accuracy_called": None,
-            "e2b_exec_success": None,
-            "no_redundant_queries": None,
-            "status": "trace_not_found",
+            "check_accuracy_called": False,
+            "sql_safe": True,
+            "e2b_called": False,
+            "calibration_ok": False,
+            "composite_score": 0.0,
+            "status": "no_output",
         }
 
-    # Extract tool calls from trace observations
-    try:
-        observations = langfuse.fetch_observations(trace_id=trace.id).data
-    except Exception:
-        observations = []
+    # check_accuracy called (from tool events OR final text fallback)
+    check_accuracy_called = run_result.check_accuracy_called
 
-    tool_calls = [
-        obs for obs in observations
-        if getattr(obs, "type", "") in ("TOOL", "tool") or
-        "tool" in getattr(obs, "name", "").lower()
-    ]
+    # SQL safety from captured queries + final text fallback
+    sql_safe = run_result.sql_safe
 
-    # SQL safety: check all execute_sql inputs are SELECT-only
-    sql_calls = [t for t in tool_calls if "execute_sql" in getattr(t, "name", "")]
-    sql_safe = all(
-        getattr(t, "input", {}).get("query", "").strip().lower().startswith(("select", "with", "explain"))
-        for t in sql_calls
-    ) if sql_calls else True  # no SQL calls = safe
+    # E2B usage
+    e2b_called = run_result.e2b_called
 
-    # check_accuracy called
-    acc_calls = [t for t in tool_calls if "check_accuracy" in getattr(t, "name", "")]
-    accuracy_called = len(acc_calls) > 0
+    # Confidence calibration
+    is_correct = output.is_fraud == case.ground_truth_is_fraud
+    calibration_ok = (
+        (is_correct and output.confidence_score >= 0.5) or
+        (not is_correct and output.confidence_score < 0.7)
+    )
 
-    # E2B success
-    e2b_calls = [t for t in tool_calls if "run_python" in getattr(t, "name", "")]
-    e2b_ok = all(
-        "❌" not in str(getattr(t, "output", ""))
-        for t in e2b_calls
-    ) if e2b_calls else None  # None if not called
-
-    # Redundant queries
-    sql_queries = [
-        getattr(t, "input", {}).get("query", "").strip()
-        for t in sql_calls
-    ]
-    has_redundancy = len(sql_queries) != len(set(sql_queries)) if sql_queries else False
+    composite = (
+        float(check_accuracy_called) * 0.35 +
+        float(sql_safe) * 0.35 +
+        float(calibration_ok) * 0.20 +
+        float(e2b_called) * 0.10
+    )
 
     return {
-        "sql_safety": sql_safe,
-        "check_accuracy_called": accuracy_called,
-        "e2b_exec_success": e2b_ok,
-        "no_redundant_queries": not has_redundancy,
+        "check_accuracy_called": check_accuracy_called,
+        "sql_safe": sql_safe,
+        "e2b_called": e2b_called,
+        "calibration_ok": calibration_ok,
+        "tools_called": run_result.tools_called,
+        "sql_query_count": len(run_result.sql_queries),
+        "composite_score": round(composite, 3),
         "status": "ok",
-        "tool_call_count": len(tool_calls),
-        "sql_call_count": len(sql_calls),
-        "e2b_call_count": len(e2b_calls),
     }
 
 
@@ -280,22 +253,21 @@ async def trace_deterministic_score(
 
 def compute_run_metrics(
     cases: list[CaseRecord],
-    outputs: dict[str, FraudAnalysisOutput | None],
+    run_results: dict[str, RunResult],
 ) -> dict:
     """Compute precision/recall/F1 for is_fraud and pattern classification."""
     y_true_fraud, y_pred_fraud = [], []
     y_true_pattern, y_pred_pattern = [], []
 
     for case in cases:
-        output = outputs.get(case.case_id)
-        if output is None:
+        rr = run_results.get(case.case_id)
+        if rr is None or rr.output is None:
             continue
 
         y_true_fraud.append(int(case.ground_truth_is_fraud))
-        y_pred_fraud.append(int(output.is_fraud))
-
+        y_pred_fraud.append(int(rr.output.is_fraud))
         y_true_pattern.append(case.ground_truth_pattern.value)
-        y_pred_pattern.append(output.fraud_pattern.value)
+        y_pred_pattern.append(rr.output.fraud_pattern.value)
 
     if not y_true_fraud:
         return {"error": "no valid predictions to evaluate"}
@@ -304,19 +276,9 @@ def compute_run_metrics(
     recall = recall_score(y_true_fraud, y_pred_fraud, zero_division=0)
     f1 = f1_score(y_true_fraud, y_pred_fraud, zero_division=0)
     accuracy = sum(a == b for a, b in zip(y_true_fraud, y_pred_fraud)) / len(y_true_fraud)
-
     cm = confusion_matrix(y_true_fraud, y_pred_fraud).tolist()
-
-    pattern_f1_macro = f1_score(
-        y_true_pattern, y_pred_pattern,
-        average="macro",
-        zero_division=0,
-    )
-    pattern_report = classification_report(
-        y_true_pattern, y_pred_pattern,
-        zero_division=0,
-        output_dict=True,
-    )
+    pattern_f1 = f1_score(y_true_pattern, y_pred_pattern, average="macro", zero_division=0)
+    pattern_report = classification_report(y_true_pattern, y_pred_pattern, zero_division=0, output_dict=True)
 
     return {
         "is_fraud": {
@@ -328,7 +290,7 @@ def compute_run_metrics(
             "n_evaluated": len(y_true_fraud),
         },
         "fraud_pattern": {
-            "macro_f1": round(pattern_f1_macro, 4),
+            "macro_f1": round(pattern_f1, 4),
             "per_class": pattern_report,
         },
     }
@@ -346,8 +308,6 @@ async def evaluate_async(
     llm_judge_timeout: int,
     llm_judge_retries: int,
     max_concurrent_cases: int,
-    max_concurrent_traces: int,
-    max_trace_wait_time: int,
     limit: Optional[int],
 ) -> None:
     """Main async evaluation loop."""
@@ -373,13 +333,15 @@ async def evaluate_async(
         cases = cases[:limit]
 
     click.echo(f"\n📋 Loaded {len(cases)} cases from {cases_path.name}")
-    click.echo(f"   Fraud: {sum(c.ground_truth_is_fraud for c in cases)} | "
-               f"Legit: {sum(not c.ground_truth_is_fraud for c in cases)}")
+    click.echo(
+        f"   Fraud: {sum(c.ground_truth_is_fraud for c in cases)} | "
+        f"Legit: {sum(not c.ground_truth_is_fraud for c in cases)}"
+    )
 
     # Upload dataset to LangFuse
     click.echo(f"\n📤 Uploading dataset to LangFuse as '{dataset_name}'...")
     try:
-        lf_dataset = langfuse.get_or_create_dataset(name=dataset_name)
+        langfuse.get_or_create_dataset(name=dataset_name)
         for case in cases:
             langfuse.create_dataset_item(
                 dataset_name=dataset_name,
@@ -402,70 +364,88 @@ async def evaluate_async(
     except Exception as e:
         logger.warning("LangFuse dataset upload failed: %s", e)
 
-    # Run agent on all cases
+    # -----------------------------------------------------------------------
+    # Run agent on all cases (Arrow 3: direct output → eval script)
+    # -----------------------------------------------------------------------
     click.echo(f"\n🤖 Running agent (max {max_concurrent_cases} concurrent, timeout={agent_timeout}s)...")
     semaphore = asyncio.Semaphore(max_concurrent_cases)
-    outputs: dict[str, FraudAnalysisOutput | None] = {}
-    errors: dict[str, str] = {}
+    run_results: dict[str, RunResult] = {}
 
     async def _run_one(case: CaseRecord) -> None:
         async with semaphore:
             try:
-                output = await asyncio.wait_for(run_case(case), timeout=agent_timeout)
-                outputs[case.case_id] = output
-                status = "✅" if output else "⚠ (no output)"
-                click.echo(f"  {case.case_id}: {status}")
+                rr = await asyncio.wait_for(run_case(case), timeout=agent_timeout)
+                run_results[case.case_id] = rr
+                status = "✅" if rr.output else "⚠ (no output)"
+                click.echo(f"  {case.case_id}: {status} | tools: {rr.tools_called}")
             except asyncio.TimeoutError:
-                errors[case.case_id] = "timeout"
-                outputs[case.case_id] = None
+                run_results[case.case_id] = RunResult(
+                    case_id=case.case_id, error="timeout"
+                )
                 click.echo(f"  {case.case_id}: ⏱ timeout")
             except Exception as e:
-                errors[case.case_id] = str(e)
-                outputs[case.case_id] = None
+                run_results[case.case_id] = RunResult(
+                    case_id=case.case_id, error=str(e)
+                )
                 click.echo(f"  {case.case_id}: ❌ {e}")
 
     await asyncio.gather(*[_run_one(c) for c in cases])
-    successful = sum(1 for v in outputs.values() if v is not None)
+    successful = sum(1 for rr in run_results.values() if rr.output is not None)
     click.echo(f"\n  Agent runs complete: {successful}/{len(cases)} successful")
 
+    # -----------------------------------------------------------------------
     # Item-level evaluation
+    # -----------------------------------------------------------------------
     click.echo("\n📊 Running item-level evaluation...")
     item_results: list[dict] = []
 
     for case in cases:
-        output = outputs.get(case.case_id)
-        if output is None:
+        rr = run_results.get(case.case_id)
+        if rr is None or rr.output is None:
             item_results.append({"case_id": case.case_id, "skipped": True})
             continue
 
-        det = deterministic_item_score(case, output)
+        # Deterministic grader
+        det = deterministic_item_score(case, rr.output)
+
+        # LLM-as-judge (Explanation Evaluator)
         llm = await llm_judge_item_score(
-            case, output, langfuse,
+            case, rr.output,
             model=settings.evaluator_model,
-            timeout=llm_judge_timeout,
             retries=llm_judge_retries,
         )
+
+        # Tool-use evaluator (Arrow 3 — direct from RunResult)
+        tool = tool_use_score(case, rr)
 
         item_result = {
             "case_id": case.case_id,
             "ground_truth_is_fraud": case.ground_truth_is_fraud,
-            "predicted_is_fraud": output.is_fraud,
+            "predicted_is_fraud": rr.output.is_fraud,
             "deterministic": det,
             "llm_judge": llm,
+            "tool_use": tool,
         }
         item_results.append(item_result)
 
-        # Upload scores to LangFuse
+        # Arrow 4: upload item scores to LangFuse
         try:
+            lf_trace_id = f"{run_name}_{case.case_id}"
             langfuse.score(
-                trace_id=case.case_id,
+                trace_id=lf_trace_id,
                 name="deterministic_composite",
                 value=det["composite_score"],
                 comment=f"is_fraud_correct={det['is_fraud_correct']}",
             )
+            langfuse.score(
+                trace_id=lf_trace_id,
+                name="tool_use_composite",
+                value=tool["composite_score"],
+                comment=f"check_accuracy={tool['check_accuracy_called']}, sql_safe={tool['sql_safe']}",
+            )
             if llm.get("overall_score") is not None:
                 langfuse.score(
-                    trace_id=case.case_id,
+                    trace_id=lf_trace_id,
                     name="explanation_quality",
                     value=llm["overall_score"],
                     comment=llm.get("brief_critique", ""),
@@ -474,45 +454,41 @@ async def evaluate_async(
             logger.debug("LangFuse score upload failed for %s: %s", case.case_id, e)
 
     # Print item-level table
-    click.echo("\n" + "=" * 80)
-    click.echo(f"{'Case ID':<12} {'GT':^6} {'Pred':^6} {'Det':^6} {'LLM':^6} {'Correct':^8}")
-    click.echo("-" * 80)
+    click.echo("\n" + "=" * 100)
+    click.echo(f"{'Case ID':<12} {'GT':^6} {'Pred':^6} {'Det':^6} {'Tool':^6} {'LLM':^6} {'Acc?':^8} {'Tools Called'}")
+    click.echo("-" * 100)
     for r in item_results:
         if r.get("skipped"):
-            click.echo(f"{r['case_id']:<12} {'—':^6} {'—':^6} {'—':^6} {'—':^6} {'SKIP':^8}")
+            click.echo(f"{r['case_id']:<12} {'—':^6} {'—':^6} {'—':^6} {'—':^6} {'—':^6} {'SKIP':^8}")
             continue
         gt = "FRAUD" if r["ground_truth_is_fraud"] else "LEGIT"
         pred = "FRAUD" if r["predicted_is_fraud"] else "LEGIT"
-        det_score = r["deterministic"]["composite_score"]
-        llm_score = r["llm_judge"].get("overall_score") or "—"
+        det_s = r["deterministic"]["composite_score"]
+        tool_s = r["tool_use"]["composite_score"]
+        llm_s = r["llm_judge"].get("overall_score") or "—"
         correct = "✅" if r["deterministic"]["is_fraud_correct"] else "❌"
-        llm_str = f"{llm_score:.2f}" if isinstance(llm_score, float) else str(llm_score)
-        click.echo(f"{r['case_id']:<12} {gt:^6} {pred:^6} {det_score:^6.3f} {llm_str:^6} {correct:^8}")
-    click.echo("=" * 80)
+        llm_str = f"{llm_s:.2f}" if isinstance(llm_s, float) else str(llm_s)
+        tools = ",".join(r["tool_use"].get("tools_called", []))
+        click.echo(
+            f"{r['case_id']:<12} {gt:^6} {pred:^6} {det_s:^6.3f} {tool_s:^6.3f} {llm_str:^6} {correct:^8} {tools}"
+        )
+    click.echo("=" * 100)
 
-    # Trace-level evaluation
-    click.echo(f"\n🔍 Running trace-level evaluation (max {max_concurrent_traces} concurrent)...")
-    trace_semaphore = asyncio.Semaphore(max_concurrent_traces)
-    trace_results: list[dict] = []
+    # Tool-use summary
+    checked = sum(1 for r in item_results if not r.get("skipped") and r["tool_use"]["check_accuracy_called"])
+    sql_safe = sum(1 for r in item_results if not r.get("skipped") and r["tool_use"]["sql_safe"])
+    e2b_used = sum(1 for r in item_results if not r.get("skipped") and r["tool_use"]["e2b_called"])
+    evaluated = sum(1 for r in item_results if not r.get("skipped"))
+    click.echo(f"\n  Tool-use summary ({evaluated} evaluated):")
+    click.echo(f"  check_accuracy called : {checked}/{evaluated}")
+    click.echo(f"  SQL safety compliant  : {sql_safe}/{evaluated}")
+    click.echo(f"  E2B (run_python) used : {e2b_used}/{evaluated}")
 
-    async def _eval_trace(case: CaseRecord) -> None:
-        async with trace_semaphore:
-            result = await trace_deterministic_score(case, langfuse, max_trace_wait_time)
-            trace_results.append({"case_id": case.case_id, **result})
-
-    await asyncio.gather(*[_eval_trace(c) for c in cases if outputs.get(c.case_id) is not None])
-
-    successful_traces = sum(1 for t in trace_results if t.get("status") == "ok")
-    acc_called = sum(1 for t in trace_results if t.get("check_accuracy_called") is True)
-    sql_safe = sum(1 for t in trace_results if t.get("sql_safety") is True)
-
-    click.echo(f"\n  Trace evaluation: {successful_traces}/{len(trace_results)} traces found")
-    click.echo(f"  check_accuracy called: {acc_called}/{len(trace_results)}")
-    click.echo(f"  SQL safety compliant: {sql_safe}/{len(trace_results)}")
-
-    # Run-level metrics
+    # -----------------------------------------------------------------------
+    # Run-level aggregate metrics (Arrow 4: upload to LangFuse)
+    # -----------------------------------------------------------------------
     click.echo("\n📈 Computing run-level aggregate metrics...")
-    run_metrics = compute_run_metrics(cases, outputs)
+    run_metrics = compute_run_metrics(cases, run_results)
 
     click.echo("\n" + "=" * 80)
     click.echo("RUN-LEVEL METRICS")
@@ -532,34 +508,19 @@ async def evaluate_async(
         if len(cm) >= 2:
             click.echo(f"  True:LEGIT  {cm[0][0]:>9}  {cm[0][1]:>9}")
             click.echo(f"  True:FRAUD  {cm[1][0]:>9}  {cm[1][1]:>9}")
-
         pm = run_metrics["fraud_pattern"]
         click.echo(f"\n  fraud_pattern macro-F1 : {pm['macro_f1']:.4f}")
-
     click.echo("=" * 80)
 
-    # Upload run-level metrics to LangFuse
+    # Arrow 4: upload aggregate metrics to LangFuse
     try:
-        langfuse.score(
-            trace_id=f"{run_name}_aggregate",
-            name="is_fraud_f1",
-            value=run_metrics.get("is_fraud", {}).get("f1", 0.0),
-        )
-        langfuse.score(
-            trace_id=f"{run_name}_aggregate",
-            name="is_fraud_precision",
-            value=run_metrics.get("is_fraud", {}).get("precision", 0.0),
-        )
-        langfuse.score(
-            trace_id=f"{run_name}_aggregate",
-            name="is_fraud_recall",
-            value=run_metrics.get("is_fraud", {}).get("recall", 0.0),
-        )
-        langfuse.score(
-            trace_id=f"{run_name}_aggregate",
-            name="pattern_macro_f1",
-            value=run_metrics.get("fraud_pattern", {}).get("macro_f1", 0.0),
-        )
+        agg_id = f"{run_name}_aggregate"
+        if "is_fraud" in run_metrics:
+            langfuse.score(trace_id=agg_id, name="is_fraud_f1", value=run_metrics["is_fraud"]["f1"])
+            langfuse.score(trace_id=agg_id, name="is_fraud_precision", value=run_metrics["is_fraud"]["precision"])
+            langfuse.score(trace_id=agg_id, name="is_fraud_recall", value=run_metrics["is_fraud"]["recall"])
+            langfuse.score(trace_id=agg_id, name="is_fraud_accuracy", value=run_metrics["is_fraud"]["accuracy"])
+            langfuse.score(trace_id=agg_id, name="pattern_macro_f1", value=run_metrics["fraud_pattern"]["macro_f1"])
         click.echo("\n✅ Aggregate metrics uploaded to LangFuse.")
     except Exception as e:
         logger.warning("LangFuse aggregate upload failed: %s", e)
@@ -581,8 +542,6 @@ async def evaluate_async(
 @click.option("--llm-judge-timeout", default=120, show_default=True)
 @click.option("--llm-judge-retries", default=3, show_default=True)
 @click.option("--max-concurrent-cases", default=settings.max_concurrent_cases, show_default=True)
-@click.option("--max-concurrent-traces", default=10, show_default=True)
-@click.option("--max-trace-wait-time", default=300, show_default=True)
 @click.option("--limit", default=None, type=int, help="Limit number of cases to evaluate.")
 def main(
     dataset_path: str,
@@ -592,8 +551,6 @@ def main(
     llm_judge_timeout: int,
     llm_judge_retries: int,
     max_concurrent_cases: int,
-    max_concurrent_traces: int,
-    max_trace_wait_time: int,
     limit: Optional[int],
 ) -> None:
     """Run the Fraud Analytics evaluation pipeline."""
@@ -608,8 +565,6 @@ def main(
         llm_judge_timeout=llm_judge_timeout,
         llm_judge_retries=llm_judge_retries,
         max_concurrent_cases=max_concurrent_cases,
-        max_concurrent_traces=max_concurrent_traces,
-        max_trace_wait_time=max_trace_wait_time,
         limit=limit,
     ))
 

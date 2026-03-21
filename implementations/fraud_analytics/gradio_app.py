@@ -1,27 +1,45 @@
 """Fraud Analytics Demo UI.
 
-Gradio app that accepts a natural language fraud query (or a Case ID from
-fraud_cases.jsonl), runs the agent, and displays the verdict with evaluation
-metrics inline.
+Gradio app that accepts a Case ID from fraud_cases.jsonl, runs the agent,
+and displays the verdict with accuracy metrics inline.
+
+Arrow 2 in the architecture diagram (UI → LangFuse) is implemented here:
+every time a user clicks Investigate, the query and agent response are logged
+as a LangFuse trace so they appear in the Trace + Metric Store.
 
 Run:
-    uv run --env-file .env gradio implementations/fraud_analytics/gradio_app.py
+    uv run --env-file .env python -m implementations.fraud_analytics.gradio_app
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 from pathlib import Path
 
 import gradio as gr
+from langfuse import Langfuse
 
 from implementations.fraud_analytics.agent import run_case
 from implementations.fraud_analytics.env_vars import settings
-from implementations.fraud_analytics.models import CaseRecord, FraudAnalysisOutput
+from implementations.fraud_analytics.models import CaseRecord, RunResult
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LangFuse client (Arrow 2: UI → LangFuse)
+# ---------------------------------------------------------------------------
+
+def _get_langfuse() -> Langfuse:
+    """Return a configured LangFuse client using env vars."""
+    return Langfuse(
+        public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+        secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
+        host=os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Load cases for the dropdown
@@ -47,7 +65,7 @@ def _load_cases() -> dict[str, CaseRecord]:
 
 
 # ---------------------------------------------------------------------------
-# Helper: run agent and format results
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
 def _verdict_badge(is_fraud: bool) -> str:
@@ -65,60 +83,104 @@ def _match_badge(match: bool | None) -> str:
     return "✅ Correct" if match else "❌ Incorrect"
 
 
-async def _run_agent_async(case: CaseRecord) -> tuple[str, str, str, str, str, str]:
-    """Run agent on a case, return tuple of UI-formatted strings."""
-    output = await run_case(case)
+# ---------------------------------------------------------------------------
+# Core investigation function
+# ---------------------------------------------------------------------------
 
-    if output is None:
-        return (
-            "❌ Agent failed to produce a valid JSON verdict.",
-            "—", "—", "—", "—", "—",
-        )
+def run_investigation(case_id: str) -> tuple[str, str, str, str, str, str, str, str]:
+    """Called by Gradio on button click.
 
-    # Compare with ground truth
-    match = output.is_fraud == case.ground_truth_is_fraud
-
-    verdict = _verdict_badge(output.is_fraud)
-    pattern = output.fraud_pattern.value.replace("_", " ").title()
-    confidence = _confidence_bar(output.confidence_score)
-    flagged = ", ".join(output.flagged_transaction_ids) if output.flagged_transaction_ids else "None"
-    accuracy = _match_badge(match)
-
-    return (
-        verdict,
-        pattern,
-        confidence,
-        flagged,
-        output.explanation,
-        accuracy,
-    )
-
-
-def run_investigation(case_id: str) -> tuple[str, str, str, str, str, str, str]:
-    """Called by Gradio on button click."""
+    Implements Arrow 2: logs query + result to LangFuse on every run.
+    Returns (trigger, ground_truth, verdict, pattern, confidence, flagged, explanation, accuracy).
+    """
     cases = _load_cases()
 
     if not cases:
         msg = (
             "⚠ No cases found. Run:\n"
-            "  uv run --env-file .env python -m implementations.fraud_analytics.data.cli create-db\n"
-            "  uv run --env-file .env python -m implementations.fraud_analytics.data.cli create-cases"
+            "  python -m implementations.fraud_analytics.data.cli create-db\n"
+            "  python -m implementations.fraud_analytics.data.cli create-cases"
         )
-        return (msg, "—", "—", "—", "—", "—", "—")
+        return (msg, "—", "—", "—", "—", "—", "—", "—")
 
     if case_id not in cases:
-        return (f"❌ Case '{case_id}' not found.", "—", "—", "—", "—", "—", "—")
+        return (f"❌ Case '{case_id}' not found.", "—", "—", "—", "—", "—", "—", "—")
 
     case = cases[case_id]
-
-    # Ground truth label (hidden from agent, shown in UI for evaluation)
     gt = _verdict_badge(case.ground_truth_is_fraud)
     trigger = case.trigger_label
 
+    # --- Arrow 2: open a LangFuse trace for this UI investigation ---
+    lf = _get_langfuse()
+    trace = lf.trace(
+        name="fraud-investigation-ui",
+        input={
+            "case_id": case.case_id,
+            "seed_transaction_id": case.seed_transaction_id,
+            "client_id": case.client_id,
+            "card_id": case.card_id,
+            "window_start": case.window_start,
+            "window_end": case.window_end,
+            "trigger": case.trigger_label,
+            "ground_truth_is_fraud": case.ground_truth_is_fraud,
+        },
+        tags=[case.case_id, "gradio-ui"],
+        metadata={"source": "gradio_app", "ground_truth": str(case.ground_truth_is_fraud)},
+    )
+
     try:
-        result = asyncio.run(_run_agent_async(case))
-        return (trigger, gt) + result
+        # Run the agent — returns RunResult (not just FraudAnalysisOutput)
+        run_result: RunResult = asyncio.run(run_case(case))
+
+        if run_result.output is None:
+            trace.update(output={"error": "Agent produced no valid JSON output"})
+            lf.flush()
+            return (
+                trigger, gt,
+                "❌ Agent failed to produce a valid JSON verdict.",
+                "—", "—", "—", "—", "—",
+            )
+
+        output = run_result.output
+        match = output.is_fraud == case.ground_truth_is_fraud
+
+        verdict = _verdict_badge(output.is_fraud)
+        pattern = output.fraud_pattern.value.replace("_", " ").title()
+        confidence = _confidence_bar(output.confidence_score)
+        flagged = ", ".join(output.flagged_transaction_ids) if output.flagged_transaction_ids else "None"
+        accuracy = _match_badge(match)
+
+        # --- Arrow 2: update trace with agent output and log a score ---
+        trace.update(
+            output={
+                "is_fraud": output.is_fraud,
+                "fraud_pattern": output.fraud_pattern.value,
+                "flagged_transaction_ids": output.flagged_transaction_ids,
+                "confidence_score": output.confidence_score,
+                "tools_called": run_result.tools_called,
+                "check_accuracy_called": run_result.check_accuracy_called,
+                "e2b_called": run_result.e2b_called,
+                "sql_query_count": len(run_result.sql_queries),
+            },
+        )
+        lf.score(
+            trace_id=trace.id,
+            name="ui_accuracy",
+            value=1.0 if match else 0.0,
+            comment=f"Predicted: {'FRAUD' if output.is_fraud else 'LEGIT'} | Ground truth: {'FRAUD' if case.ground_truth_is_fraud else 'LEGIT'}",
+        )
+        lf.score(
+            trace_id=trace.id,
+            name="confidence_score",
+            value=output.confidence_score,
+        )
+        lf.flush()
+
+        return (trigger, gt, verdict, pattern, confidence, flagged, output.explanation, accuracy)
+
     except Exception as e:
+        trace.update(output={"error": str(e)})
+        lf.flush()
         logger.exception("Agent run failed for case %s", case_id)
         return (trigger, gt, f"❌ Error: {e}", "—", "—", "—", "—", "—")
 
@@ -140,6 +202,7 @@ with gr.Blocks(title="Fraud Analytics Agent") as demo:
 # 🔍 Fraud Analytics Investigation Agent
 Select a case from the dropdown and click **Investigate** to run the agent.
 The agent uses SQL, Python analysis (E2B), and ground-truth label lookup to produce a verdict.
+Every investigation is logged to LangFuse for observability.
         """
     )
 
@@ -175,7 +238,6 @@ The agent uses SQL, Python analysis (E2B), and ground-truth label lookup to prod
         max_lines=30,
     )
 
-    # Wire up
     run_btn.click(
         fn=run_investigation,
         inputs=[case_dropdown],
@@ -200,9 +262,9 @@ The agent uses SQL, Python analysis (E2B), and ground-truth label lookup to prod
         """
 ---
 **Tips:**
-- Make sure `create-db` and `create-cases` have been run before launching this app.
-- The agent calls `check_accuracy()` internally, so accuracy is self-reported in the explanation.
-- The **Accuracy vs Ground Truth** field here shows the post-hoc comparison done by the UI.
+- Every investigation is logged to LangFuse automatically (Arrow 2 in the architecture).
+- The agent calls `check_accuracy()` internally — accuracy is self-reported in the explanation.
+- The **Accuracy vs Ground Truth** field shows the post-hoc comparison done by the UI.
         """
     )
 

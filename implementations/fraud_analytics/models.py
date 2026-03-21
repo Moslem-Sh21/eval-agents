@@ -3,6 +3,7 @@
 FraudAnalysisOutput  – structured verdict produced by the agent per case.
 CaseRecord           – investigation case with seed transaction + ground truth.
 AccuracyResult       – returned by the check_accuracy tool.
+RunResult            – wraps agent output + raw text for direct eval (Arrow 3).
 """
 
 from __future__ import annotations
@@ -113,3 +114,75 @@ class AccuracyResult(BaseModel):
     agent_prediction: bool
     match: bool = Field(description="True if agent prediction matches ground truth.")
     message: str = Field(description="Human-readable summary for the agent to reason about.")
+
+
+class RunResult(BaseModel):
+    """Carries the full agent run output for direct evaluation (Arrow 3).
+
+    run_case() returns this instead of FraudAnalysisOutput directly so that
+    evaluate.py can inspect the raw agent text and tool-call evidence
+    without needing to poll LangFuse traces.
+
+    This is the key data structure that implements Arrow 3 in the diagram:
+    Fraud Analytics System → Offline Evaluation Script (directly).
+    """
+
+    case_id: str = Field(description="Case ID this run corresponds to.")
+
+    output: Optional[FraudAnalysisOutput] = Field(
+        default=None,
+        description="Parsed structured output. None if parsing failed.",
+    )
+
+    final_text: str = Field(
+        default="",
+        description=(
+            "The agent's complete final response text. Used by evaluate.py "
+            "to detect tool usage (check_accuracy called, SQL patterns, E2B usage) "
+            "without polling LangFuse."
+        ),
+    )
+
+    tools_called: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of tools called during this run, extracted from ADK events. "
+            "e.g. ['get_schema', 'execute_sql', 'check_accuracy']"
+        ),
+    )
+
+    sql_queries: list[str] = Field(
+        default_factory=list,
+        description="All SQL queries executed during this run (for safety checking).",
+    )
+
+    e2b_called: bool = Field(
+        default=False,
+        description="True if run_python() was called at least once.",
+    )
+
+    error: Optional[str] = Field(
+        default=None,
+        description="Error message if the agent run failed entirely.",
+    )
+
+    @property
+    def check_accuracy_called(self) -> bool:
+        """True if the agent called check_accuracy during this run."""
+        return (
+            "check_accuracy" in self.tools_called
+            or "prediction correct" in self.final_text.lower()
+            or "prediction incorrect" in self.final_text.lower()
+        )
+
+    @property
+    def sql_safe(self) -> bool:
+        """True if all SQL queries were read-only (no write keywords)."""
+        write_keywords = ["insert into", "update ", "delete from", "drop table", "create table"]
+        for query in self.sql_queries:
+            q_lower = query.lower()
+            if any(kw in q_lower for kw in write_keywords):
+                return False
+        # Also scan the final text as a fallback
+        text_lower = self.final_text.lower()
+        return not any(kw in text_lower for kw in write_keywords)
