@@ -5,7 +5,7 @@ and displays the verdict with accuracy metrics inline.
 
 Arrow 2 in the architecture diagram (UI → LangFuse) is implemented here:
 every time a user clicks Investigate, the query and agent response are logged
-as a LangFuse trace so they appear in the Trace + Metric Store.
+to LangFuse as scores so they appear in the Trace + Metric Store.
 
 Run:
     uv run --env-file .env python -m implementations.fraud_analytics.gradio_app
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -29,16 +30,69 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# LangFuse client (Arrow 2: UI → LangFuse)
+# LangFuse logging (Arrow 2: UI → LangFuse)
 # ---------------------------------------------------------------------------
 
-def _get_langfuse() -> Langfuse:
-    """Return a configured LangFuse client using env vars."""
-    return Langfuse(
-        public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
-        secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
-        host=os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
-    )
+def _log_to_langfuse(case: CaseRecord, run_result: RunResult, match: bool) -> None:
+    """Log investigation result to LangFuse as scores.
+
+    Uses lf.score() directly — compatible with Langfuse v3 SDK which removed
+    the lf.trace() method. Each investigation gets a unique trace_id so scores
+    can be tracked per case in the LangFuse dashboard.
+    """
+    try:
+        lf = Langfuse(
+            public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+            secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
+            host=os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
+        )
+        # Unique trace_id per investigation: case_id + timestamp
+        trace_id = f"ui_{case.case_id}_{int(time.time())}"
+
+        # Core accuracy score
+        lf.score(
+            trace_id=trace_id,
+            name="ui_accuracy",
+            value=1.0 if match else 0.0,
+            comment=(
+                f"Case {case.case_id} | "
+                f"GT: {'FRAUD' if case.ground_truth_is_fraud else 'LEGIT'} | "
+                f"Pred: {'FRAUD' if run_result.output and run_result.output.is_fraud else 'LEGIT'}"
+            ),
+        )
+
+        if run_result.output:
+            # Confidence score
+            lf.score(
+                trace_id=trace_id,
+                name="confidence_score",
+                value=run_result.output.confidence_score,
+                comment=f"Pattern: {run_result.output.fraud_pattern.value}",
+            )
+
+        # Tool-use scores
+        lf.score(
+            trace_id=trace_id,
+            name="check_accuracy_called",
+            value=1.0 if run_result.check_accuracy_called else 0.0,
+        )
+        lf.score(
+            trace_id=trace_id,
+            name="sql_safe",
+            value=1.0 if run_result.sql_safe else 0.0,
+        )
+        lf.score(
+            trace_id=trace_id,
+            name="e2b_called",
+            value=1.0 if run_result.e2b_called else 0.0,
+        )
+
+        lf.flush()
+        logger.info("LangFuse scores uploaded for %s (trace_id: %s)", case.case_id, trace_id)
+
+    except Exception as e:
+        # LangFuse logging is non-fatal — agent result is returned regardless
+        logger.warning("LangFuse logging failed (non-fatal): %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +145,8 @@ def run_investigation(case_id: str) -> tuple[str, str, str, str, str, str, str, 
     """Called by Gradio on button click.
 
     Implements Arrow 2: logs query + result to LangFuse on every run.
-    Returns (trigger, ground_truth, verdict, pattern, confidence, flagged, explanation, accuracy).
+    Returns (trigger, ground_truth, verdict, pattern, confidence,
+             flagged, explanation, accuracy).
     """
     cases = _load_cases()
 
@@ -110,31 +165,13 @@ def run_investigation(case_id: str) -> tuple[str, str, str, str, str, str, str, 
     gt = _verdict_badge(case.ground_truth_is_fraud)
     trigger = case.trigger_label
 
-    # --- Arrow 2: open a LangFuse trace for this UI investigation ---
-    lf = _get_langfuse()
-    trace = lf.trace(
-        name="fraud-investigation-ui",
-        input={
-            "case_id": case.case_id,
-            "seed_transaction_id": case.seed_transaction_id,
-            "client_id": case.client_id,
-            "card_id": case.card_id,
-            "window_start": case.window_start,
-            "window_end": case.window_end,
-            "trigger": case.trigger_label,
-            "ground_truth_is_fraud": case.ground_truth_is_fraud,
-        },
-        tags=[case.case_id, "gradio-ui"],
-        metadata={"source": "gradio_app", "ground_truth": str(case.ground_truth_is_fraud)},
-    )
-
     try:
-        # Run the agent — returns RunResult (not just FraudAnalysisOutput)
+        # Run the agent — returns RunResult carrying output + tool-call metadata
         run_result: RunResult = asyncio.run(run_case(case))
 
         if run_result.output is None:
-            trace.update(output={"error": "Agent produced no valid JSON output"})
-            lf.flush()
+            # Log failure to LangFuse even when agent produces no output
+            _log_to_langfuse(case, run_result, match=False)
             return (
                 trigger, gt,
                 "❌ Agent failed to produce a valid JSON verdict.",
@@ -147,40 +184,18 @@ def run_investigation(case_id: str) -> tuple[str, str, str, str, str, str, str, 
         verdict = _verdict_badge(output.is_fraud)
         pattern = output.fraud_pattern.value.replace("_", " ").title()
         confidence = _confidence_bar(output.confidence_score)
-        flagged = ", ".join(output.flagged_transaction_ids) if output.flagged_transaction_ids else "None"
+        flagged = (
+            ", ".join(output.flagged_transaction_ids)
+            if output.flagged_transaction_ids else "None"
+        )
         accuracy = _match_badge(match)
 
-        # --- Arrow 2: update trace with agent output and log a score ---
-        trace.update(
-            output={
-                "is_fraud": output.is_fraud,
-                "fraud_pattern": output.fraud_pattern.value,
-                "flagged_transaction_ids": output.flagged_transaction_ids,
-                "confidence_score": output.confidence_score,
-                "tools_called": run_result.tools_called,
-                "check_accuracy_called": run_result.check_accuracy_called,
-                "e2b_called": run_result.e2b_called,
-                "sql_query_count": len(run_result.sql_queries),
-            },
-        )
-        lf.score(
-            trace_id=trace.id,
-            name="ui_accuracy",
-            value=1.0 if match else 0.0,
-            comment=f"Predicted: {'FRAUD' if output.is_fraud else 'LEGIT'} | Ground truth: {'FRAUD' if case.ground_truth_is_fraud else 'LEGIT'}",
-        )
-        lf.score(
-            trace_id=trace.id,
-            name="confidence_score",
-            value=output.confidence_score,
-        )
-        lf.flush()
+        # Arrow 2: log to LangFuse
+        _log_to_langfuse(case, run_result, match)
 
         return (trigger, gt, verdict, pattern, confidence, flagged, output.explanation, accuracy)
 
     except Exception as e:
-        trace.update(output={"error": str(e)})
-        lf.flush()
         logger.exception("Agent run failed for case %s", case_id)
         return (trigger, gt, f"❌ Error: {e}", "—", "—", "—", "—", "—")
 
