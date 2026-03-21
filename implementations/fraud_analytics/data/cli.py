@@ -53,7 +53,8 @@ def _infer_fraud_pattern(row: pd.Series) -> FraudPattern:
 
     use_chip = str(row.get("use_chip", "")).lower()
     errors = str(row.get("errors", "") or "")
-    amount = float(row.get("amount", 0) or 0)
+    amount_raw = str(row.get("amount", "0") or "0").replace("$", "").replace(",", "").strip()
+    amount = float(amount_raw) if amount_raw else 0.0
 
     if "online" in use_chip:
         return FraudPattern.CARD_NOT_PRESENT
