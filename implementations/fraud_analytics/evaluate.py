@@ -341,7 +341,7 @@ async def evaluate_async(
     # Upload dataset to LangFuse
     click.echo(f"\n📤 Uploading dataset to LangFuse as '{dataset_name}'...")
     try:
-        langfuse.get_or_create_dataset(name=dataset_name)
+        langfuse.create_dataset(name=dataset_name)
         for case in cases:
             langfuse.create_dataset_item(
                 dataset_name=dataset_name,
