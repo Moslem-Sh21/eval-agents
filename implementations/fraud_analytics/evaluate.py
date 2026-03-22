@@ -146,22 +146,41 @@ async def llm_judge_item_score(
 {output.explanation}
 """
 
-    import google.generativeai as genai  # type: ignore
+    from google import genai  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
+
+    client = genai.Client()
 
     for attempt in range(retries):
         try:
-            model_client = genai.GenerativeModel(model)
-            response = model_client.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
                     temperature=0.0,
-                    max_output_tokens=512,
+                    max_output_tokens=1024,
                 ),
             )
-            text = response.text.strip()
+            # Safely extract text — finish_reason=MAX_TOKENS truncates parts
+            text = ""
+            if response.candidates:
+                candidate = response.candidates[0]
+                if candidate.content and candidate.content.parts:
+                    text = "".join(
+                        p.text for p in candidate.content.parts if hasattr(p, "text") and p.text
+                    ).strip()
+
+            if not text:
+                finish = (
+                    response.candidates[0].finish_reason
+                    if response.candidates else "unknown"
+                )
+                raise ValueError(f"Empty response from LLM judge (finish_reason={finish})")
+
             json_match = re.search(r"\{.*\}", text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
+            raise ValueError(f"No JSON found in LLM judge response: {text[:200]}")
         except Exception as e:
             logger.warning(
                 "LLM judge attempt %d/%d failed for case %s: %s",
