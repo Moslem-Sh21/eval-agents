@@ -132,19 +132,21 @@ async def llm_judge_item_score(
     rubric_path = Path(__file__).parent / "rubrics" / "explanation_quality.md"
     rubric = rubric_path.read_text() if rubric_path.exists() else "(rubric not found)"
 
-    prompt = f"""{rubric}
+    # Keep prompt concise — prepend explicit JSON-only instruction so model
+    # doesn't write a long preamble before the JSON object (causes MAX_TOKENS).
+    prompt = f"""You are an evaluation judge. Score the fraud analysis explanation below using the rubric.
+Respond ONLY with a valid JSON object — no preamble, no markdown, no extra text.
 
----
+{rubric}
 
-## Case to Evaluate
+## Case
+is_fraud: {output.is_fraud}
+fraud_pattern: {output.fraud_pattern.value}
+confidence_score: {output.confidence_score}
+explanation (truncated to 500 chars): {output.explanation[:500] if output.explanation else ""}
 
-**is_fraud:** {output.is_fraud}
-**fraud_pattern:** {output.fraud_pattern.value}
-**flagged_transaction_ids:** {output.flagged_transaction_ids}
-**confidence_score:** {output.confidence_score}
-**explanation:**
-{output.explanation}
-"""
+Return exactly:
+{{"evidence_grounding": <1-5>, "logical_coherence": <1-5>, "pattern_identification": <1-5>, "confidence_calibration": <1-5>, "overall_score": <1.0-5.0>, "brief_critique": "<one sentence>"}}"""
 
     from google import genai  # type: ignore
     from google.genai import types as genai_types  # type: ignore
@@ -158,7 +160,8 @@ async def llm_judge_item_score(
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     temperature=0.0,
-                    max_output_tokens=1024,
+                    max_output_tokens=2048,
+                    response_mime_type="application/json",
                 ),
             )
             # Safely extract text — finish_reason=MAX_TOKENS truncates parts
