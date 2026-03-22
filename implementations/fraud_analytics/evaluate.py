@@ -547,6 +547,12 @@ async def evaluate_async(
     except Exception as e:
         logger.warning("LangFuse aggregate upload failed: %s", e)
 
+    # Save full results to JSON (includes LLM judge critiques per case)
+    results_path = Path(dataset_path).parent / f"eval_results_{run_name}.json"
+    with open(results_path, "w") as f:
+        json.dump(item_results, f, indent=2, default=str)
+    click.echo(f"\n💾 Full results saved to {results_path}")
+
     langfuse.flush()
     click.echo(f"\n✅ Evaluation complete. Run name: '{run_name}'")
     click.echo("   View results at https://us.cloud.langfuse.com")
