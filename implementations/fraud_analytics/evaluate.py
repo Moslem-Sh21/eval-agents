@@ -146,7 +146,7 @@ confidence_score: {output.confidence_score}
 explanation (truncated to 500 chars): {output.explanation[:500] if output.explanation else ""}
 
 Return exactly:
-{{"evidence_grounding": <1-5>, "logical_coherence": <1-5>, "pattern_identification": <1-5>, "confidence_calibration": <1-5>, "overall_score": <1.0-5.0>, "brief_critique": "<one sentence>"}}"""
+{{"evidence_grounding": <1-5>, "logical_coherence": <1-5>, "pattern_identification": <1-5>, "confidence_calibration": <1-5>, "overall_score": <1.0-5.0>, "brief_critique": "<max 10 words>"}}"""
 
     from google import genai  # type: ignore
     from google.genai import types as genai_types  # type: ignore
@@ -160,7 +160,7 @@ Return exactly:
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     temperature=0.0,
-                    max_output_tokens=2048,
+                    max_output_tokens=4096,
                     response_mime_type="application/json",
                 ),
             )
@@ -180,9 +180,24 @@ Return exactly:
                 )
                 raise ValueError(f"Empty response from LLM judge (finish_reason={finish})")
 
+            # Try direct parse first (response_mime_type=json skips wrapping)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+
+            # Fallback: regex for complete JSON object
             json_match = re.search(r"\{.*\}", text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
+
+            # Last resort: if truncated mid-string, close the JSON manually
+            if text.startswith("{") and not text.endswith("}"):
+                try:
+                    return json.loads(text + '"}'  + "}")
+                except json.JSONDecodeError:
+                    pass
+
             raise ValueError(f"No JSON found in LLM judge response: {text[:200]}")
         except Exception as e:
             logger.warning(

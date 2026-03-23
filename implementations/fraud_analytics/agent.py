@@ -507,7 +507,37 @@ async def run_case(case: CaseRecord) -> RunResult:
 
     if json_match:
         try:
-            output = FraudAnalysisOutput.model_validate_json(json_match.group(1))
+            raw_json = json_match.group(1)
+            # Normalize fraud_pattern before Pydantic validation.
+            # The agent occasionally produces close variants of valid enum values
+            # (e.g. "identity_thievery" instead of "identity_theft"). We map
+            # these to the nearest valid value so the case isn't skipped entirely.
+            _PATTERN_ALIASES: dict[str, str] = {
+                "identity_thievery": "identity_theft",
+                "identity theft": "identity_theft",
+                "card not present": "card_not_present",
+                "account takeover": "account_takeover",
+                "unusual velocity": "unusual_velocity",
+                "geo anomaly": "geo_anomaly",
+                "merchant fraud": "merchant_fraud",
+                "card_not_present_fraud": "card_not_present",
+                "velocity": "unusual_velocity",
+                "geographic_anomaly": "geo_anomaly",
+            }
+            try:
+                parsed = json.loads(raw_json)
+                raw_pattern = str(parsed.get("fraud_pattern", "")).strip().lower()
+                if raw_pattern in _PATTERN_ALIASES:
+                    logger.warning(
+                        "Normalizing fraud_pattern '%s' → '%s' for case %s",
+                        raw_pattern, _PATTERN_ALIASES[raw_pattern], case.case_id,
+                    )
+                    parsed["fraud_pattern"] = _PATTERN_ALIASES[raw_pattern]
+                    raw_json = json.dumps(parsed)
+            except json.JSONDecodeError:
+                pass  # let Pydantic handle the error below
+
+            output = FraudAnalysisOutput.model_validate_json(raw_json)
         except Exception as e:
             logger.warning("Failed to parse agent output for %s: %s", case.case_id, e)
 
