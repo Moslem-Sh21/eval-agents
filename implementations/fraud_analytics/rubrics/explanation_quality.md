@@ -22,8 +22,8 @@ Does the explanation reference specific, concrete data from SQL or Python output
 
 | Score | Criteria |
 |-------|----------|
-| 5 | References specific amounts, dates, merchant IDs, transaction counts, and/or computed statistics |
-| 4 | References most concrete details with minor omissions |
+| 5 | References specific amounts, dates, merchant IDs, transaction counts, and/or computed statistics. **Must also explicitly consider and rule out at least one plausible benign explanation** (e.g. "this could be a legitimate high-value purchase, but is inconsistent with X because Y") |
+| 4 | References most concrete details with minor omissions. May not rule out benign alternatives explicitly |
 | 3 | References some data but is partly vague or generic |
 | 2 | Very few concrete references; mostly generic fraud reasoning |
 | 1 | No specific evidence cited; pure speculation |
@@ -61,7 +61,39 @@ Is the confidence score consistent with the strength of evidence presented?
 | 2 | Confidence is significantly miscalibrated |
 | 1 | Confidence completely contradicts the evidence (e.g. 0.95 with no supporting evidence) |
 
+## Hard Guardrails — Check These Before Scoring
+
+These override dimension scores when specific failure conditions are met.
+Apply them first before assigning any scores.
+
+**Guardrail 1 — Contradiction with output fields:**
+- If the explanation contradicts `is_fraud` (e.g. explanation says "no suspicious activity found" but `is_fraud=true`) → force `logical_coherence = 1` and `overall_score = 1` regardless of other dimensions.
+- If the explanation names a different pattern than `fraud_pattern` (e.g. explanation says "card_not_present" but `fraud_pattern="unusual_velocity"`) → force `pattern_identification = 1`.
+
+**Guardrail 2 — Material unsupported claims:**
+- If the explanation makes specific factual claims (exact amounts, specific dates, merchant names, transaction IDs) that could not have come from the agent's queries → force `evidence_grounding <= 2`.
+- This catches hallucination: an agent inventing data rather than querying it.
+
+**Guardrail 3 — Placeholder or empty pattern description:**
+- If `fraud_pattern` is a non-null, non-"none" value but the explanation contains no meaningful description of the pattern (e.g. just repeats the enum name with no elaboration) → force `pattern_identification <= 2`.
+
+---
+
+## Special Cases
+
+**When `fraud_pattern` is `"unknown"` or `"none"`:**
+- If `is_fraud=true` and ground truth pattern is `unknown`, do not penalize the agent for naming a specific pattern as long as it is coherent with the transaction evidence presented.
+- If `is_fraud=false`, the correct pattern is `none`. Any non-none pattern named alongside `is_fraud=false` triggers Guardrail 1.
+
+**When Python analysis (E2B) was used:**
+- If the explanation references Python-computed statistics (velocity, rolling averages, distribution comparisons), treat these as valid evidence equivalent to SQL results for `evidence_grounding` scoring.
+
+---
+
 ## Output Format
+
+Apply Hard Guardrails first, then score each dimension independently, then compute `overall_score` as the simple average of the four dimensions.
+
 Return ONLY a JSON object with this exact structure:
 ```json
 {
