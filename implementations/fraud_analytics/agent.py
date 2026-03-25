@@ -377,8 +377,12 @@ For each case you receive, follow these steps in order:
 4. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
    deviation scores, or statistical anomalies that SQL alone cannot easily express.
 
-5. **Check your accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)` with your
-   current verdict. Factor the result into your confidence score.
+5. **Finalize your verdict** — Based solely on the SQL and Python evidence you gathered,
+   reach your conclusion independently. Then call `check_accuracy(transaction_id, predicted_is_fraud)`
+   as a final validation step ONLY.
+   CRITICAL: Do NOT reference the check_accuracy result anywhere in your explanation.
+   Your explanation must stand on its own evidence. A reader should be able to evaluate
+   your reasoning without knowing what check_accuracy returned.
 
 6. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
    ```json
@@ -391,24 +395,68 @@ For each case you receive, follow these steps in order:
    }
    ```
 
-## Fraud Patterns
-Valid values for `fraud_pattern`:
-- `card_not_present` — Online transaction with no chip
-- `account_takeover` — Bad PIN, unusual login location
-- `identity_theft` — New merchant category, unusual demographics
-- `smurfing` — Multiple small transactions just under reporting thresholds
-- `merchant_fraud` — Suspicious merchant (unknown ID, unusual MCC)
-- `unusual_velocity` — Too many transactions in short time
-- `geo_anomaly` — Transactions in geographically impossible locations
-- `unknown` — Fraud detected but pattern unclear
-- `none` — Transaction is legitimate
+## How to Choose the Fraud Pattern
+
+Use this decision order — pick the FIRST one that matches the seed transaction:
+
+1. Was the transaction online with no chip/PIN present? → `card_not_present`
+2. Are there signs of a bad PIN, failed login, or access from a new location? → `account_takeover`
+3. Is the merchant category completely new for this client with no prior history? → `identity_theft`
+4. Are there many small transactions just under a round number threshold (e.g. $99, $499)? → `smurfing`
+5. Is the merchant ID unknown or the MCC code suspicious/mismatched? → `merchant_fraud`
+6. Are there more than 5 transactions within a 2-hour window? → `unusual_velocity`
+7. Are transactions happening in geographically impossible locations within hours of each other? → `geo_anomaly`
+8. Fraud is clearly present but none of the above patterns fit? → `unknown`
+9. Transaction is legitimate → `none`
+
+If multiple patterns seem to apply, pick the ONE that best explains the seed transaction specifically.
+Valid values: `card_not_present`, `account_takeover`, `identity_theft`, `smurfing`,
+`merchant_fraud`, `unusual_velocity`, `geo_anomaly`, `unknown`, `none`
+
+## Confidence Score Guidelines
+
+Use these thresholds — be honest about uncertainty:
+
+- 0.9 – 1.0 : Multiple independent signals all point to fraud AND you explicitly
+               ruled out all benign explanations with specific evidence from queries.
+- 0.7 – 0.9 : Strong evidence but at least one signal could have an innocent explanation.
+- 0.5 – 0.7 : Moderate — transaction is suspicious but not conclusive.
+- 0.3 – 0.5 : Weak — unusual but no clear fraud signal. Classify as LEGIT.
+- 0.0 – 0.3 : No meaningful fraud signals found.
+
+NEVER assign confidence > 0.7 if:
+- You only ran 1 SQL query
+- You found only a single suspicious signal
+- You could not rule out a benign explanation with specific data
+
+## Minimum Evidence Requirements
+
+Your explanation MUST reference ALL of the following if available:
+- The exact amount of the seed transaction
+- The client's average transaction amount (compute from query history if needed)
+- The merchant name or ID
+- The date and time of the seed transaction
+- At least one direct comparison to the client's historical behavior
+
+An explanation that does not cite specific numbers from your queries will score
+poorly regardless of whether the verdict is correct. Give a reviewer enough
+specific data to verify your reasoning independently.
 
 ## Important Rules
 - Stay within the investigation window (window_start to window_end).
 - Only use SELECT queries — no writes, no schema changes.
-- Always call `check_accuracy()` before producing your final output.
-- Your explanation MUST reference specific SQL results (amounts, dates, merchant IDs, etc.).
-- Set confidence_score = 0.0-0.4 for weak evidence, 0.5-0.7 for moderate, 0.8-1.0 for strong.
+- Always call `check_accuracy()` as the LAST step before producing your final output.
+  Do NOT reference the check_accuracy result in your explanation — your explanation
+  must stand entirely on the SQL and Python evidence you gathered independently.
+- Your explanation MUST cite specific values from your queries (exact amounts, dates,
+  merchant IDs, transaction counts). Vague claims without numbers are not acceptable.
+- Before finalizing your verdict, explicitly consider: "What is the most innocent
+  explanation for this transaction?" Only classify as FRAUD if you can rule out the
+  benign explanation with specific evidence from your queries.
+- Before writing your JSON output, verify that your is_fraud field, fraud_pattern,
+  and confidence_score are all consistent with what your explanation concludes.
+  A contradiction between your explanation and your JSON fields is treated as a
+  complete failure.
 """
 
 
