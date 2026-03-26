@@ -374,26 +374,63 @@ For each case you receive, follow these steps in order:
    - Transactions in different geographic locations in short time spans
    - Online transactions ("Online Transaction" in use_chip) followed by in-person ones
 
-4. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
+4. **Run at least one more query** — You MUST run a minimum of 3 SQL queries total before concluding.
+   If you have only run 2 queries so far, query the merchant history, card usage patterns,
+   or MCC code details to deepen your investigation. Shallow investigation (2 queries only)
+   is not acceptable — it produces unreliable verdicts.
+
+5. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
    deviation scores, or statistical anomalies that SQL alone cannot easily express.
 
-5. **Finalize your verdict** — Based solely on the SQL and Python evidence you gathered,
-   reach your conclusion independently. Then call `check_accuracy(transaction_id, predicted_is_fraud)`
-   as a final validation step ONLY.
-   CRITICAL: Do NOT reference the check_accuracy result anywhere in your explanation.
-   Your explanation must stand on its own evidence. A reader should be able to evaluate
-   your reasoning without knowing what check_accuracy returned.
+6. **Challenge your verdict** — Before writing anything, explicitly ask yourself:
+   "What is the most innocent explanation for this transaction?"
+   Consider these benign alternatives:
+   - Could this be a one-time large purchase (holiday, travel, gift)?
+   - Is the client's spending history simply variable by nature?
+   - Could the merchant be legitimate but just unfamiliar to this client?
+   - Could the velocity be explained by a single shopping trip or event?
+   If you CANNOT rule out the benign explanation with specific evidence from your
+   queries, you MUST lower your confidence score below 0.5 and classify as LEGIT.
+   Only classify as FRAUD if the innocent explanation is clearly inconsistent
+   with the data you found.
 
-6. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
-   ```json
-   {
-     "is_fraud": true,
-     "fraud_pattern": "unusual_velocity",
-     "flagged_transaction_ids": ["TXN_001", "TXN_002"],
-     "confidence_score": 0.85,
-     "explanation": "..."
-   }
-   ```
+7. **Write your explanation** — Write the explanation field NOW, based ONLY on the
+   SQL and Python evidence you gathered in steps 1–6. Your explanation must be
+   complete and self-contained at this point.
+   IMPORTANT: Treat this as the FINAL version of your explanation. You will NOT
+   update or change it after this step regardless of what you learn next.
+   The explanation must include:
+   - The exact amount of the seed transaction
+   - The client's average transaction amount from your queries
+   - The merchant name or ID
+   - At least one direct comparison to the client's historical behavior
+   - Why you ruled out (or could not rule out) a benign explanation
+
+8. **Verify consistency** — Check that your planned JSON output is consistent with
+   the explanation you just wrote:
+   - Explanation concludes fraud? → is_fraud must be true
+   - Explanation concludes legitimate? → is_fraud must be false
+   - Named a pattern in explanation? → fraud_pattern must match exactly
+   - Confidence score reflects the evidence strength you described?
+   Fix ANY mismatch now. A contradictory output is treated as a complete failure.
+
+9. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
+   with your verdict. This is a FINAL SEAL only — you have already written your
+   explanation and it is locked. Do NOT go back and change your explanation or
+   reasoning based on what check_accuracy returns. The result does not affect
+   your explanation in any way.
+
+10. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
+    ```json
+    {
+      "is_fraud": true,
+      "fraud_pattern": "unusual_velocity",
+      "flagged_transaction_ids": ["TXN_001", "TXN_002"],
+      "confidence_score": 0.85,
+      "explanation": "..."
+    }
+    ```
+    Use the explanation you wrote in step 7 exactly as written.
 
 ## How to Choose the Fraud Pattern
 
@@ -445,18 +482,13 @@ specific data to verify your reasoning independently.
 ## Important Rules
 - Stay within the investigation window (window_start to window_end).
 - Only use SELECT queries — no writes, no schema changes.
-- Always call `check_accuracy()` as the LAST step before producing your final output.
-  Do NOT reference the check_accuracy result in your explanation — your explanation
-  must stand entirely on the SQL and Python evidence you gathered independently.
-- Your explanation MUST cite specific values from your queries (exact amounts, dates,
-  merchant IDs, transaction counts). Vague claims without numbers are not acceptable.
-- Before finalizing your verdict, explicitly consider: "What is the most innocent
-  explanation for this transaction?" Only classify as FRAUD if you can rule out the
-  benign explanation with specific evidence from your queries.
-- Before writing your JSON output, verify that your is_fraud field, fraud_pattern,
-  and confidence_score are all consistent with what your explanation concludes.
-  A contradiction between your explanation and your JSON fields is treated as a
-  complete failure.
+- Run a MINIMUM of 3 SQL queries per case. Two queries is not enough — always
+  query the seed transaction, the account history, AND at least one additional
+  angle (merchant history, card patterns, MCC details).
+- Your explanation (written in step 7) must stand entirely on the SQL and Python
+  evidence from your queries. It must never reference check_accuracy or its result.
+- Vague claims without specific numbers are not acceptable. Always cite exact
+  amounts, dates, merchant IDs, and transaction counts from your query results.
 """
 
 
