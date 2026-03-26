@@ -374,28 +374,29 @@ For each case you receive, follow these steps in order:
    - Transactions in different geographic locations in short time spans
    - Online transactions ("Online Transaction" in use_chip) followed by in-person ones
 
-4. **Run at least one more query** — You MUST run a minimum of 3 SQL queries total before concluding.
-   If you have only run 2 queries so far, query the merchant history, card usage patterns,
-   or MCC code details to deepen your investigation. Shallow investigation (2 queries only)
-   is not acceptable — it produces unreliable verdicts.
-
-5. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
+4. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
    deviation scores, or statistical anomalies that SQL alone cannot easily express.
+   If you found a clear fraud signal in steps 2–3, additional queries are optional.
+   If the evidence is ambiguous, run more queries before concluding.
 
-6. **Challenge your verdict** — Before writing anything, explicitly ask yourself:
+5. **Challenge your verdict** — Before writing anything, ask yourself:
    "What is the most innocent explanation for this transaction?"
    Consider these benign alternatives:
    - Could this be a one-time large purchase (holiday, travel, gift)?
    - Is the client's spending history simply variable by nature?
    - Could the merchant be legitimate but just unfamiliar to this client?
    - Could the velocity be explained by a single shopping trip or event?
-   If you CANNOT rule out the benign explanation with specific evidence from your
-   queries, you MUST lower your confidence score below 0.5 and classify as LEGIT.
-   Only classify as FRAUD if the innocent explanation is clearly inconsistent
-   with the data you found.
+   Use this to calibrate your confidence, not to override clear evidence:
+   - If the evidence strongly points to fraud AND the benign explanation is
+     inconsistent with your query results → classify as FRAUD with high confidence.
+   - If the evidence is ambiguous and a benign explanation is plausible →
+     lower your confidence score (0.5–0.7) but still classify based on the
+     balance of evidence, not on whether you can rule out every alternative.
+   - Only classify as LEGIT if the evidence does NOT support fraud, not merely
+     because a benign explanation is theoretically possible.
 
-7. **Write your explanation** — Write the explanation field NOW, based ONLY on the
-   SQL and Python evidence you gathered in steps 1–6. Your explanation must be
+6. **Write your explanation** — Write the explanation field NOW, based ONLY on the
+   SQL and Python evidence you gathered in steps 1–5. Your explanation must be
    complete and self-contained at this point.
    IMPORTANT: Treat this as the FINAL version of your explanation. You will NOT
    update or change it after this step regardless of what you learn next.
@@ -404,9 +405,10 @@ For each case you receive, follow these steps in order:
    - The client's average transaction amount from your queries
    - The merchant name or ID
    - At least one direct comparison to the client's historical behavior
-   - Why you ruled out (or could not rule out) a benign explanation
+   - Your assessment of the most plausible innocent explanation and why the
+     evidence does or does not support it
 
-8. **Verify consistency** — Check that your planned JSON output is consistent with
+7. **Verify consistency** — Check that your planned JSON output is consistent with
    the explanation you just wrote:
    - Explanation concludes fraud? → is_fraud must be true
    - Explanation concludes legitimate? → is_fraud must be false
@@ -414,23 +416,23 @@ For each case you receive, follow these steps in order:
    - Confidence score reflects the evidence strength you described?
    Fix ANY mismatch now. A contradictory output is treated as a complete failure.
 
-9. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
+8. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
    with your verdict. This is a FINAL SEAL only — you have already written your
    explanation and it is locked. Do NOT go back and change your explanation or
    reasoning based on what check_accuracy returns. The result does not affect
    your explanation in any way.
 
-10. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
-    ```json
-    {
-      "is_fraud": true,
-      "fraud_pattern": "unusual_velocity",
-      "flagged_transaction_ids": ["TXN_001", "TXN_002"],
-      "confidence_score": 0.85,
-      "explanation": "..."
-    }
-    ```
-    Use the explanation you wrote in step 7 exactly as written.
+9. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
+   ```json
+   {
+     "is_fraud": true,
+     "fraud_pattern": "unusual_velocity",
+     "flagged_transaction_ids": ["TXN_001", "TXN_002"],
+     "confidence_score": 0.85,
+     "explanation": "..."
+   }
+   ```
+   Use the explanation you wrote in step 6 exactly as written.
 
 ## How to Choose the Fraud Pattern
 
@@ -482,13 +484,12 @@ specific data to verify your reasoning independently.
 ## Important Rules
 - Stay within the investigation window (window_start to window_end).
 - Only use SELECT queries — no writes, no schema changes.
-- Run a MINIMUM of 3 SQL queries per case. Two queries is not enough — always
-  query the seed transaction, the account history, AND at least one additional
-  angle (merchant history, card patterns, MCC details).
-- Your explanation (written in step 7) must stand entirely on the SQL and Python
+- Your explanation (written in step 6) must stand entirely on the SQL and Python
   evidence from your queries. It must never reference check_accuracy or its result.
 - Vague claims without specific numbers are not acceptable. Always cite exact
   amounts, dates, merchant IDs, and transaction counts from your query results.
+- Classify based on the balance of evidence. A theoretically possible innocent
+  explanation does not override strong fraud signals in the data.
 """
 
 
