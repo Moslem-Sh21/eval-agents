@@ -29,26 +29,26 @@ WINDOW_DAYS = 7
 
 
 def txn_id() -> str:
-    return f"SYN_TXN_{uuid.uuid4().hex[:8].upper()}"
+    return f"SYN_{uuid.uuid4().hex[:12].upper()}"
 
-def client_id(n: int) -> str:
-    return f"SYN_CLIENT_{n:04d}"
+def client_id(n: int) -> int:
+    return 90000 + n
 
-def card_id(n: int) -> str:
-    return f"SYN_CARD_{n:04d}"
+def card_id(n: int) -> int:
+    return 90000 + n
 
-def merchant_id(name: str) -> str:
-    return f"SYN_MERCH_{name.upper().replace(' ', '_')[:12]}"
+def merchant_id(name: str) -> int:
+    return abs(hash(name)) % 900000 + 100000
 
 
 def insert_transactions(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.executemany("""
         INSERT OR IGNORE INTO transactions (
-            transaction_id, client_id, card_id, amount, use_chip,
+            id, client_id, card_id, amount, use_chip,
             merchant_id, merchant_city, merchant_state, zip, mcc,
             errors, is_fraud, date
         ) VALUES (
-            :transaction_id, :client_id, :card_id, :amount, :use_chip,
+            :id, :client_id, :card_id, :amount, :use_chip,
             :merchant_id, :merchant_city, :merchant_state, :zip, :mcc,
             :errors, :is_fraud, :date
         )
@@ -61,10 +61,10 @@ def normal_history(cid: int, anchor: datetime, n: int = 15) -> list[dict]:
     for i in range(n):
         dt = anchor - timedelta(days=i * 2, hours=i % 8)
         rows.append({
-            "transaction_id": txn_id(),
+            "id": txn_id(),
             "client_id": client_id(cid),
             "card_id": card_id(cid),
-            "amount": round(20 + (i % 5) * 15 + 0.99, 2),
+            "amount": f"${round(20 + (i % 5) * 15 + 0.99, 2)}",
             "use_chip": "Chip Transaction",
             "merchant_id": merchant_id(f"GROCERY_{i%3}"),
             "merchant_city": "New York", "merchant_state": "NY",
@@ -79,8 +79,8 @@ def scenario_card_not_present(conn, cid, anchor):
     history = normal_history(cid, anchor)
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 847.99, "use_chip": "Online Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$847.99", "use_chip": "Online Transaction",
         "merchant_id": merchant_id("ELECTRONICS_ONLINE"),
         "merchant_city": "Online", "merchant_state": "CA", "zip": "90210", "mcc": 5732,
         "errors": None, "is_fraud": 1, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -96,8 +96,8 @@ def scenario_unusual_velocity(conn, cid, anchor):
     for i in range(8):
         tid = seed_txn if i == 0 else txn_id()
         txns.append({
-            "transaction_id": tid, "client_id": client_id(cid), "card_id": card_id(cid),
-            "amount": round(19.99 + i * 2, 2), "use_chip": "Chip Transaction",
+            "id": tid, "client_id": client_id(cid), "card_id": card_id(cid),
+            "amount": f"${round(19.99 + i * 2, 2)}", "use_chip": "Chip Transaction",
             "merchant_id": merchant_id(f"STORE_{i}"),
             "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 5999,
             "errors": None, "is_fraud": 1,
@@ -113,16 +113,16 @@ def scenario_account_takeover(conn, cid, anchor):
     error_txns = []
     for i in range(3):
         error_txns.append({
-            "transaction_id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
-            "amount": 500.0, "use_chip": "Chip Transaction",
+            "id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
+            "amount": "$500.0", "use_chip": "Chip Transaction",
             "merchant_id": merchant_id("ATM_DOWNTOWN"),
             "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 6011,
             "errors": "Bad PIN", "is_fraud": 1,
             "date": (anchor - timedelta(minutes=15 - i * 4)).strftime("%Y-%m-%d %H:%M:%S"),
         })
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 1200.0, "use_chip": "Chip Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$1200.0", "use_chip": "Chip Transaction",
         "merchant_id": merchant_id("ATM_DOWNTOWN"),
         "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 6011,
         "errors": None, "is_fraud": 1, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -135,8 +135,8 @@ def scenario_identity_theft(conn, cid, anchor):
     history = normal_history(cid, anchor)
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 3200.00, "use_chip": "Chip Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$3200.00", "use_chip": "Chip Transaction",
         "merchant_id": merchant_id("FINE_JEWELLERY"),
         "merchant_city": "Beverly Hills", "merchant_state": "CA", "zip": "90210", "mcc": 5944,
         "errors": None, "is_fraud": 1, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -153,7 +153,7 @@ def scenario_smurfing(conn, cid, anchor):
     for i, amt in enumerate(amounts):
         tid = seed_txn if i == 0 else txn_id()
         txns.append({
-            "transaction_id": tid, "client_id": client_id(cid), "card_id": card_id(cid),
+            "id": tid, "client_id": client_id(cid), "card_id": card_id(cid),
             "amount": amt, "use_chip": "Online Transaction",
             "merchant_id": merchant_id(f"WIRE_SERVICE_{i}"),
             "merchant_city": "Online", "merchant_state": "TX", "zip": "75001", "mcc": 6051,
@@ -168,8 +168,8 @@ def scenario_merchant_fraud(conn, cid, anchor):
     history = normal_history(cid, anchor)
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 1750.00, "use_chip": "Chip Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$1750.00", "use_chip": "Chip Transaction",
         "merchant_id": "UNKNOWN_MERCH_ZZ99999",
         "merchant_city": "Las Vegas", "merchant_state": "NV", "zip": "89101", "mcc": 5999,
         "errors": None, "is_fraud": 1, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -181,8 +181,8 @@ def scenario_merchant_fraud(conn, cid, anchor):
 def scenario_geo_anomaly(conn, cid, anchor):
     history = normal_history(cid, anchor)
     nyc_txn = {
-        "transaction_id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 45.00, "use_chip": "Chip Transaction",
+        "id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$45.00", "use_chip": "Chip Transaction",
         "merchant_id": merchant_id("NYC_COFFEE"),
         "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 5812,
         "errors": None, "is_fraud": 0,
@@ -190,8 +190,8 @@ def scenario_geo_anomaly(conn, cid, anchor):
     }
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 620.00, "use_chip": "Chip Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$620.00", "use_chip": "Chip Transaction",
         "merchant_id": merchant_id("LONDON_HOTEL"),
         "merchant_city": "London", "merchant_state": "ENG", "zip": "EC1A", "mcc": 7011,
         "errors": None, "is_fraud": 1, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -204,16 +204,16 @@ def scenario_unknown_pattern(conn, cid, anchor):
     history = normal_history(cid, anchor)
     seed_txn = txn_id()
     declined = {
-        "transaction_id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 312.00, "use_chip": "Online Transaction",
+        "id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$312.00", "use_chip": "Online Transaction",
         "merchant_id": merchant_id("RETAIL_MID"),
         "merchant_city": "Miami", "merchant_state": "FL", "zip": "33101", "mcc": 5411,
         "errors": "Insufficient funds", "is_fraud": 1,
         "date": (anchor - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"),
     }
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 312.00, "use_chip": "Online Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$312.00", "use_chip": "Online Transaction",
         "merchant_id": merchant_id("RETAIL_MID"),
         "merchant_city": "Miami", "merchant_state": "FL", "zip": "33101", "mcc": 5411,
         "errors": None, "is_fraud": 1, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -226,8 +226,8 @@ def scenario_legit_high_amount(conn, cid, anchor):
     history = []
     for i in range(10):
         history.append({
-            "transaction_id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
-            "amount": round(400 + (i % 4) * 200 + 0.99, 2), "use_chip": "Chip Transaction",
+            "id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
+            "amount": f"${round(400 + (i % 4) * 200 + 0.99, 2)}", "use_chip": "Chip Transaction",
             "merchant_id": merchant_id(f"DEPT_STORE_{i%2}"),
             "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 5311,
             "errors": None, "is_fraud": 0,
@@ -235,8 +235,8 @@ def scenario_legit_high_amount(conn, cid, anchor):
         })
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 1100.00, "use_chip": "Chip Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$1100.00", "use_chip": "Chip Transaction",
         "merchant_id": merchant_id("TRAVEL_AGENCY"),
         "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 4722,
         "errors": None, "is_fraud": 0, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -249,8 +249,8 @@ def scenario_legit_new_merchant(conn, cid, anchor):
     history = normal_history(cid, anchor)
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 34.50, "use_chip": "Chip Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$34.50", "use_chip": "Chip Transaction",
         "merchant_id": merchant_id("NEW_RESTAURANT_A"),
         "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 5812,
         "errors": None, "is_fraud": 0, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -266,8 +266,8 @@ def scenario_legit_velocity(conn, cid, anchor):
     for i in range(5):
         tid = seed_txn if i == 0 else txn_id()
         txns.append({
-            "transaction_id": tid, "client_id": client_id(cid), "card_id": card_id(cid),
-            "amount": round(12 + i * 8 + 0.49, 2), "use_chip": "Chip Transaction",
+            "id": tid, "client_id": client_id(cid), "card_id": card_id(cid),
+            "amount": f"${round(12 + i * 8 + 0.49, 2)}", "use_chip": "Chip Transaction",
             "merchant_id": merchant_id("SUPERMARKET_A"),
             "merchant_city": "New York", "merchant_state": "NY", "zip": "10001", "mcc": 5411,
             "errors": None, "is_fraud": 0,
@@ -281,8 +281,8 @@ def scenario_legit_online(conn, cid, anchor):
     history = []
     for i in range(12):
         history.append({
-            "transaction_id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
-            "amount": round(25 + (i % 6) * 10 + 0.99, 2), "use_chip": "Online Transaction",
+            "id": txn_id(), "client_id": client_id(cid), "card_id": card_id(cid),
+            "amount": f"${round(25 + (i % 6) * 10 + 0.99, 2)}", "use_chip": "Online Transaction",
             "merchant_id": merchant_id(f"ONLINE_RETAIL_{i%4}"),
             "merchant_city": "Online", "merchant_state": "CA", "zip": "90210", "mcc": 5732,
             "errors": None, "is_fraud": 0,
@@ -290,8 +290,8 @@ def scenario_legit_online(conn, cid, anchor):
         })
     seed_txn = txn_id()
     seed = {
-        "transaction_id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
-        "amount": 89.99, "use_chip": "Online Transaction",
+        "id": seed_txn, "client_id": client_id(cid), "card_id": card_id(cid),
+        "amount": "$89.99", "use_chip": "Online Transaction",
         "merchant_id": merchant_id("ONLINE_RETAIL_5"),
         "merchant_city": "Online", "merchant_state": "CA", "zip": "90210", "mcc": 5732,
         "errors": None, "is_fraud": 0, "date": anchor.strftime("%Y-%m-%d %H:%M:%S"),
@@ -332,8 +332,8 @@ def main() -> None:
         case = CaseRecord(
             case_id=f"SYN_{i:04d}",
             seed_transaction_id=seed_txn,
-            client_id=client_id(cid),
-            card_id=card_id(cid),
+            client_id=str(client_id(cid)),
+            card_id=str(card_id(cid)),
             window_start=(anchor - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d"),
             window_end=(anchor + timedelta(days=1)).strftime("%Y-%m-%d"),
             trigger_label=description,
