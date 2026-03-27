@@ -379,21 +379,28 @@ For each case you receive, follow these steps in order:
    If you found a clear fraud signal in steps 2–3, additional queries are optional.
    If the evidence is ambiguous, run more queries before concluding.
 
-5. **Challenge your verdict** — Before writing anything, ask yourself:
-   "What is the most innocent explanation for this transaction?"
-   Consider these benign alternatives:
+5. **Challenge your verdict** — Before writing anything, apply these rules strictly:
+
+   SINGLE SIGNAL RULE: If you found only ONE suspicious signal (e.g. just a high
+   amount, or just an unfamiliar merchant, or just an online transaction), you MUST
+   classify as LEGIT. A single anomaly is not sufficient evidence for fraud. You need
+   at least TWO independent signals that together cannot be explained by normal behavior.
+
+   BENIGN EXPLANATION TEST: Ask yourself "What is the most innocent explanation?"
    - Could this be a one-time large purchase (holiday, travel, gift)?
    - Is the client's spending history simply variable by nature?
    - Could the merchant be legitimate but just unfamiliar to this client?
    - Could the velocity be explained by a single shopping trip or event?
-   Use this to calibrate your confidence, not to override clear evidence:
-   - If the evidence strongly points to fraud AND the benign explanation is
-     inconsistent with your query results → classify as FRAUD with high confidence.
-   - If the evidence is ambiguous and a benign explanation is plausible →
-     lower your confidence score (0.5–0.7) but still classify based on the
-     balance of evidence, not on whether you can rule out every alternative.
-   - Only classify as LEGIT if the evidence does NOT support fraud, not merely
-     because a benign explanation is theoretically possible.
+
+   CLASSIFICATION RULES:
+   - TWO OR MORE independent fraud signals AND benign explanation is inconsistent
+     with query data → classify as FRAUD. State both signals explicitly.
+   - ONE suspicious signal OR benign explanation is plausible → classify as LEGIT,
+     set confidence 0.3–0.5 to reflect the uncertainty.
+   - No suspicious signals → classify as LEGIT with confidence 0.1–0.3.
+
+   If you cannot name at least two specific, independent fraud signals from your
+   query results, you do not have enough evidence — classify as LEGIT.
 
 6. **Write your explanation** — Write the explanation field NOW, based ONLY on the
    SQL and Python evidence you gathered in steps 1–5. Your explanation must be
@@ -458,15 +465,15 @@ Use these thresholds — be honest about uncertainty:
 
 - 0.9 – 1.0 : Multiple independent signals all point to fraud AND you explicitly
                ruled out all benign explanations with specific evidence from queries.
-- 0.7 – 0.9 : Strong evidence but at least one signal could have an innocent explanation.
-- 0.5 – 0.7 : Moderate — transaction is suspicious but not conclusive.
-- 0.3 – 0.5 : Weak — unusual but no clear fraud signal. Classify as LEGIT.
-- 0.0 – 0.3 : No meaningful fraud signals found.
+- 0.7 – 0.9 : Two or more strong signals, benign explanation inconsistent with data.
+- 0.5 – 0.7 : Two signals present but one could have an innocent explanation.
+- 0.3 – 0.5 : Only one suspicious signal found — classify as LEGIT.
+- 0.0 – 0.3 : No meaningful fraud signals found — classify as LEGIT.
 
-NEVER assign confidence > 0.7 if:
-- You only ran 1 SQL query
-- You found only a single suspicious signal
-- You could not rule out a benign explanation with specific data
+NEVER classify as FRAUD if:
+- You found only one suspicious signal, regardless of how strong it seems
+- You cannot name the second independent signal explicitly in your explanation
+- The benign explanation fits the query data as well as the fraud explanation
 
 ## Minimum Evidence Requirements
 
@@ -488,8 +495,11 @@ specific data to verify your reasoning independently.
   evidence from your queries. It must never reference check_accuracy or its result.
 - Vague claims without specific numbers are not acceptable. Always cite exact
   amounts, dates, merchant IDs, and transaction counts from your query results.
-- Classify based on the balance of evidence. A theoretically possible innocent
-  explanation does not override strong fraud signals in the data.
+- A single suspicious signal is NEVER sufficient to classify as FRAUD. You must
+  identify at least two independent signals and name them both explicitly.
+- A theoretically possible innocent explanation does not override strong fraud
+  signals, but a plausible innocent explanation combined with only one fraud signal
+  means you must classify as LEGIT.
 """
 
 
