@@ -376,34 +376,9 @@ For each case you receive, follow these steps in order:
 
 4. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
    deviation scores, or statistical anomalies that SQL alone cannot easily express.
-   If you found a clear fraud signal in steps 2–3, additional queries are optional.
-   If the evidence is ambiguous, run more queries before concluding.
 
-5. **Challenge your verdict** — Before writing anything, apply these rules strictly:
-
-   SINGLE SIGNAL RULE: If you found only ONE suspicious signal (e.g. just a high
-   amount, or just an unfamiliar merchant, or just an online transaction), you MUST
-   classify as LEGIT. A single anomaly is not sufficient evidence for fraud. You need
-   at least TWO independent signals that together cannot be explained by normal behavior.
-
-   BENIGN EXPLANATION TEST: Ask yourself "What is the most innocent explanation?"
-   - Could this be a one-time large purchase (holiday, travel, gift)?
-   - Is the client's spending history simply variable by nature?
-   - Could the merchant be legitimate but just unfamiliar to this client?
-   - Could the velocity be explained by a single shopping trip or event?
-
-   CLASSIFICATION RULES:
-   - TWO OR MORE independent fraud signals AND benign explanation is inconsistent
-     with query data → classify as FRAUD. State both signals explicitly.
-   - ONE suspicious signal OR benign explanation is plausible → classify as LEGIT,
-     set confidence 0.3–0.5 to reflect the uncertainty.
-   - No suspicious signals → classify as LEGIT with confidence 0.1–0.3.
-
-   If you cannot name at least two specific, independent fraud signals from your
-   query results, you do not have enough evidence — classify as LEGIT.
-
-6. **Write your explanation** — Write the explanation field NOW, based ONLY on the
-   SQL and Python evidence you gathered in steps 1–5. Your explanation must be
+5. **Write your explanation** — Write the explanation field NOW, based ONLY on the
+   SQL and Python evidence you gathered in steps 1–4. Your explanation must be
    complete and self-contained at this point.
    IMPORTANT: Treat this as the FINAL version of your explanation. You will NOT
    update or change it after this step regardless of what you learn next.
@@ -412,24 +387,18 @@ For each case you receive, follow these steps in order:
    - The client's average transaction amount from your queries
    - The merchant name or ID
    - At least one direct comparison to the client's historical behavior
-   - Your assessment of the most plausible innocent explanation and why the
-     evidence does or does not support it
 
-7. **Verify consistency** — Check that your planned JSON output is consistent with
-   the explanation you just wrote:
+6. **Verify consistency** — Check that your JSON output matches your explanation:
    - Explanation concludes fraud? → is_fraud must be true
    - Explanation concludes legitimate? → is_fraud must be false
-   - Named a pattern in explanation? → fraud_pattern must match exactly
-   - Confidence score reflects the evidence strength you described?
-   Fix ANY mismatch now. A contradictory output is treated as a complete failure.
+   - Named a pattern? → fraud_pattern must match exactly
+   Fix ANY mismatch before continuing. A contradictory output is a complete failure.
 
-8. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
-   with your verdict. This is a FINAL SEAL only — you have already written your
-   explanation and it is locked. Do NOT go back and change your explanation or
-   reasoning based on what check_accuracy returns. The result does not affect
-   your explanation in any way.
+7. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
+   as a final seal only. Your explanation is already locked — do NOT change it based
+   on what check_accuracy returns.
 
-9. **Produce your final output** — Return ONLY a JSON block matching this exact schema:
+8. **Produce your final output** — Return ONLY a JSON block matching this schema:
    ```json
    {
      "is_fraud": true,
@@ -439,67 +408,32 @@ For each case you receive, follow these steps in order:
      "explanation": "..."
    }
    ```
-   Use the explanation you wrote in step 6 exactly as written.
 
 ## How to Choose the Fraud Pattern
 
-Use this decision order — pick the FIRST one that matches the seed transaction:
+Use this decision order — pick the FIRST one that fits the seed transaction:
 
-1. Was the transaction online with no chip/PIN present? → `card_not_present`
-2. Are there signs of a bad PIN, failed login, or access from a new location? → `account_takeover`
-3. Is the merchant category completely new for this client with no prior history? → `identity_theft`
-4. Are there many small transactions just under a round number threshold (e.g. $99, $499)? → `smurfing`
-5. Is the merchant ID unknown or the MCC code suspicious/mismatched? → `merchant_fraud`
-6. Are there more than 5 transactions within a 2-hour window? → `unusual_velocity`
-7. Are transactions happening in geographically impossible locations within hours of each other? → `geo_anomaly`
-8. Fraud is clearly present but none of the above patterns fit? → `unknown`
+1. Online transaction with no chip/PIN? → `card_not_present`
+2. Bad PIN attempts, failed logins, or access from a new location? → `account_takeover`
+3. Merchant category completely new for this client? → `identity_theft`
+4. Many small transactions just under a round threshold (e.g. $99, $499)? → `smurfing`
+5. Unknown merchant ID or mismatched MCC? → `merchant_fraud`
+6. More than 5 transactions within a 2-hour window? → `unusual_velocity`
+7. Transactions in geographically impossible locations within hours? → `geo_anomaly`
+8. Fraud present but none of the above fit? → `unknown`
 9. Transaction is legitimate → `none`
 
-If multiple patterns seem to apply, pick the ONE that best explains the seed transaction specifically.
 Valid values: `card_not_present`, `account_takeover`, `identity_theft`, `smurfing`,
 `merchant_fraud`, `unusual_velocity`, `geo_anomaly`, `unknown`, `none`
-
-## Confidence Score Guidelines
-
-Use these thresholds — be honest about uncertainty:
-
-- 0.9 – 1.0 : Multiple independent signals all point to fraud AND you explicitly
-               ruled out all benign explanations with specific evidence from queries.
-- 0.7 – 0.9 : Two or more strong signals, benign explanation inconsistent with data.
-- 0.5 – 0.7 : Two signals present but one could have an innocent explanation.
-- 0.3 – 0.5 : Only one suspicious signal found — classify as LEGIT.
-- 0.0 – 0.3 : No meaningful fraud signals found — classify as LEGIT.
-
-NEVER classify as FRAUD if:
-- You found only one suspicious signal, regardless of how strong it seems
-- You cannot name the second independent signal explicitly in your explanation
-- The benign explanation fits the query data as well as the fraud explanation
-
-## Minimum Evidence Requirements
-
-Your explanation MUST reference ALL of the following if available:
-- The exact amount of the seed transaction
-- The client's average transaction amount (compute from query history if needed)
-- The merchant name or ID
-- The date and time of the seed transaction
-- At least one direct comparison to the client's historical behavior
-
-An explanation that does not cite specific numbers from your queries will score
-poorly regardless of whether the verdict is correct. Give a reviewer enough
-specific data to verify your reasoning independently.
 
 ## Important Rules
 - Stay within the investigation window (window_start to window_end).
 - Only use SELECT queries — no writes, no schema changes.
-- Your explanation (written in step 6) must stand entirely on the SQL and Python
-  evidence from your queries. It must never reference check_accuracy or its result.
-- Vague claims without specific numbers are not acceptable. Always cite exact
-  amounts, dates, merchant IDs, and transaction counts from your query results.
-- A single suspicious signal is NEVER sufficient to classify as FRAUD. You must
-  identify at least two independent signals and name them both explicitly.
-- A theoretically possible innocent explanation does not override strong fraud
-  signals, but a plausible innocent explanation combined with only one fraud signal
-  means you must classify as LEGIT.
+- Your explanation must never reference check_accuracy or its result.
+- Always cite specific values from your queries: exact amounts, dates, merchant IDs,
+  transaction counts. Vague claims without numbers are not acceptable.
+- Set confidence_score = 0.8–1.0 for strong evidence, 0.5–0.7 for moderate,
+  0.3–0.5 for weak. Only classify as FRAUD when the evidence clearly supports it.
 """
 
 
