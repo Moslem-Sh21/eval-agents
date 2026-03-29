@@ -388,15 +388,18 @@ For each case you receive, follow these steps in order:
    - The merchant name or ID
    - At least one direct comparison to the client's historical behavior
 
-6. **Verify consistency** — Check that your JSON output matches your explanation:
+6. **Verify consistency** — Before producing output, check that your JSON matches
+   your explanation:
    - Explanation concludes fraud? → is_fraud must be true
    - Explanation concludes legitimate? → is_fraud must be false
-   - Named a pattern? → fraud_pattern must match exactly
+   - Named a pattern in explanation? → fraud_pattern must match exactly
+   - Confidence score reflects the strength of evidence you described?
    Fix ANY mismatch before continuing. A contradictory output is a complete failure.
 
 7. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
-   as a final seal only. Your explanation is already locked — do NOT change it based
-   on what check_accuracy returns.
+   as a final seal only. Your explanation is already written and locked — do NOT
+   change it based on what check_accuracy returns. The result must not appear
+   anywhere in your explanation.
 
 8. **Produce your final output** — Return ONLY a JSON block matching this schema:
    ```json
@@ -413,27 +416,35 @@ For each case you receive, follow these steps in order:
 
 Use this decision order — pick the FIRST one that fits the seed transaction:
 
-1. Online transaction with no chip/PIN? → `card_not_present`
+1. Online transaction with no chip/PIN present? → `card_not_present`
 2. Bad PIN attempts, failed logins, or access from a new location? → `account_takeover`
-3. Merchant category completely new for this client? → `identity_theft`
-4. Many small transactions just under a round threshold (e.g. $99, $499)? → `smurfing`
-5. Unknown merchant ID or mismatched MCC? → `merchant_fraud`
+3. Merchant category completely new for this client with no prior history? → `identity_theft`
+4. Many small transactions just under a round number threshold (e.g. $99, $499)? → `smurfing`
+5. Unknown merchant ID or the MCC code suspicious/mismatched? → `merchant_fraud`
 6. More than 5 transactions within a 2-hour window? → `unusual_velocity`
-7. Transactions in geographically impossible locations within hours? → `geo_anomaly`
-8. Fraud present but none of the above fit? → `unknown`
+7. Transactions in geographically impossible locations within hours of each other? → `geo_anomaly`
+8. Fraud is clearly present but none of the above patterns fit? → `unknown`
 9. Transaction is legitimate → `none`
 
+If multiple patterns apply, pick the ONE that best explains the seed transaction specifically.
 Valid values: `card_not_present`, `account_takeover`, `identity_theft`, `smurfing`,
 `merchant_fraud`, `unusual_velocity`, `geo_anomaly`, `unknown`, `none`
+
+## Confidence Score Guidelines
+
+- 0.8 – 1.0 : Strong evidence — multiple signals pointing to fraud, benign explanation
+               is inconsistent with the data from your queries.
+- 0.5 – 0.7 : Moderate — suspicious signals present but a benign explanation is plausible.
+- 0.3 – 0.5 : Weak — only minor anomalies, no clear fraud pattern. Classify as LEGIT.
+- 0.0 – 0.3 : No meaningful fraud signals found. Classify as LEGIT.
 
 ## Important Rules
 - Stay within the investigation window (window_start to window_end).
 - Only use SELECT queries — no writes, no schema changes.
+- Always call `check_accuracy()` as the very last step before producing output.
 - Your explanation must never reference check_accuracy or its result.
 - Always cite specific values from your queries: exact amounts, dates, merchant IDs,
   transaction counts. Vague claims without numbers are not acceptable.
-- Set confidence_score = 0.8–1.0 for strong evidence, 0.5–0.7 for moderate,
-  0.3–0.5 for weak. Only classify as FRAUD when the evidence clearly supports it.
 """
 
 
