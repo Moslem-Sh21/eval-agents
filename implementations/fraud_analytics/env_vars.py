@@ -103,7 +103,7 @@ class FraudAnalyticsSettings(BaseSettings):
     # Agent / model config — reuse global Gemini keys from .env
     # ------------------------------------------------------------------
     agent_model: str = Field(
-        default="gemini-2.5-flash",
+        default="gemini-2.5-pro",
         description="Gemini model for the fraud agent worker.",
     )
     evaluator_model: str = Field(
