@@ -377,8 +377,22 @@ For each case you receive, follow these steps in order:
 4. **Run deeper analysis if needed** — Use `run_python()` to compute velocity metrics,
    deviation scores, or statistical anomalies that SQL alone cannot easily express.
 
-5. **Write your explanation** — Write the explanation field NOW, based ONLY on the
-   SQL and Python evidence you gathered in steps 1–4. Your explanation must be
+5. **Apply the benign explanation test** — Before writing anything, ask yourself:
+   "Can I explain this transaction as normal client behavior based on the data I found?"
+
+   Go through these checks and answer each one from your query results:
+   - Is the amount within 3× the client's historical average? → likely normal spending
+   - Has the client used this merchant or MCC category before? → likely normal merchant
+   - Is the transaction in the same city/state as prior transactions? → no geo anomaly
+   - Are there no declined transactions or PIN errors nearby? → no account compromise
+   - Is the transaction count in the last 2 hours under 5? → no velocity issue
+
+   If the answer to ALL of these is "normal", classify as LEGIT — you do not have
+   enough evidence for fraud. Only classify as FRAUD when at least one check clearly
+   fails AND the failure cannot be explained by the client's own history.
+
+6. **Write your explanation** — Write the explanation field NOW, based ONLY on the
+   SQL and Python evidence you gathered in steps 1–5. Your explanation must be
    complete and self-contained at this point.
    IMPORTANT: Treat this as the FINAL version of your explanation. You will NOT
    update or change it after this step regardless of what you learn next.
@@ -387,8 +401,9 @@ For each case you receive, follow these steps in order:
    - The client's average transaction amount from your queries
    - The merchant name or ID
    - At least one direct comparison to the client's historical behavior
+   - Which benign explanation check(s) failed and why
 
-6. **Verify consistency** — Before producing output, check that your JSON matches
+7. **Verify consistency** — Before producing output, check that your JSON matches
    your explanation:
    - Explanation concludes fraud? → is_fraud must be true
    - Explanation concludes legitimate? → is_fraud must be false
@@ -396,12 +411,12 @@ For each case you receive, follow these steps in order:
    - Confidence score reflects the strength of evidence you described?
    Fix ANY mismatch before continuing. A contradictory output is a complete failure.
 
-7. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
+8. **Call check_accuracy** — Call `check_accuracy(transaction_id, predicted_is_fraud)`
    as a final seal only. Your explanation is already written and locked — do NOT
    change it based on what check_accuracy returns. The result must not appear
    anywhere in your explanation.
 
-8. **Produce your final output** — Return ONLY a JSON block matching this schema:
+9. **Produce your final output** — Return ONLY a JSON block matching this schema:
    ```json
    {
      "is_fraud": true,
@@ -418,7 +433,7 @@ Use this decision order — pick the FIRST one that fits the seed transaction:
 
 1. Online transaction with no chip/PIN present? → `card_not_present`
 2. Bad PIN attempts, failed logins, or access from a new location? → `account_takeover`
-3. Merchant category completely new for this client with no prior history? → `identity_theft`
+3. Merchant category (MCC) completely new for this client AND amount is unusually high? → `identity_theft`
 4. Many small transactions just under a round number threshold (e.g. $99, $499)? → `smurfing`
 5. Unknown merchant ID or the MCC code suspicious/mismatched? → `merchant_fraud`
 6. More than 5 transactions within a 2-hour window? → `unusual_velocity`
