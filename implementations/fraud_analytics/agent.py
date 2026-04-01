@@ -381,7 +381,7 @@ For each case you receive, follow these steps in order:
    "Can I explain this transaction as normal client behavior based on the data I found?"
 
    Go through these checks and answer each one from your query results:
-   - Is the amount within 3× the client's historical average? → likely normal spending
+   - Is the amount within 2× the client's historical average? → likely normal spending
    - Has the client used this merchant or MCC category before? → likely normal merchant
    - Is the transaction in the same city/state as prior transactions? → no geo anomaly
    - Are there no declined transactions or PIN errors nearby? → no account compromise
